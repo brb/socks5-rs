@@ -4,7 +4,6 @@ extern crate bytes;
 use mio::*;
 use mio::tcp::{TcpListener, TcpStream};
 use std::collections::HashMap;
-use std::io;
 use std::net::Ipv4Addr;
 use std::io::{Read, Write};
 use bytes::{BytesMut, BufMut, ByteOrder, BigEndian};
@@ -13,14 +12,15 @@ struct Conn {
     socket: TcpStream,
     state: State,
     read_buf: BytesMut,
-    read_left: isize,
     write_buf: BytesMut,
 }
 
 #[derive(PartialEq)]
 enum State {
-    ReadFirstRequestHdr,
+    ReadFirstRequest,
+    WriteFirstReply,
     ReadSecondRequest,
+    WriteSecondReply,
 }
 
 const SERVER: Token = Token(0);
@@ -53,10 +53,14 @@ fn main() {
                     if event.readiness().is_readable() {
                         let mut conn = &mut conns.get_mut(&token_index).unwrap();
                         match conn.state {
-                            State::ReadFirstRequestHdr =>
-                                handle_read_first_request_hdr(&mut conn),
+                            State::ReadFirstRequest =>
+                                handle_read_first_request(&mut conn),
+                            State::WriteFirstReply =>
+                                panic!("NYI"),
                             State::ReadSecondRequest =>
                                 handle_read_second_request(&mut conn),
+                            State::WriteSecondReply =>
+                                panic!("NYI"),
                         }
                     }
                 }
@@ -72,9 +76,8 @@ fn accept_connection(server: &TcpListener, token_index: usize, poll: &Poll, conn
 
     let conn = Conn{
         socket: socket,
-        state: State::ReadFirstRequestHdr,
+        state: State::ReadFirstRequest,
         read_buf: BytesMut::with_capacity(64),
-        read_left: 2, // SOCKS_VSN + AUTH_METHODS_COUNT
         write_buf: BytesMut::with_capacity(64),
     };
     conns.insert(token, conn);
@@ -82,56 +85,51 @@ fn accept_connection(server: &TcpListener, token_index: usize, poll: &Poll, conn
 
 // TODO trait for states
 
-fn handle_read_first_request_hdr(conn: &mut Conn) {
+fn handle_read_first_request(conn: &mut Conn) {
     let mut buf = [0; 64];
     let socket = &mut conn.socket;
-    let mut size = socket.read(&mut buf).unwrap();
 
+    let size = socket.read(&mut buf).unwrap();
     conn.read_buf.put(&buf[0 .. size]);
-    conn.read_left -= size as isize;
 
-    if conn.read_left > 0 {
+    let len = conn.read_buf.len();
+    if len < 2 || len < conn.read_buf[1] as usize + 2 {
         return;
     }
 
-    // FIXME
-    conn.read_left += conn.read_buf[1] as isize; // auth meth count
+    let reply = [5, 0];
+    let size = socket.write(&reply).unwrap();
+    if size != reply.len() { panic!("oops"); }
 
-    if conn.read_left == 0 {
-
-        let reply = [5, 0];
-        size = socket.write(&reply).unwrap();
-        if size != reply.len() {
-            panic!("oops");
-        }
-
-        conn.state = State::ReadSecondRequest;
-        conn.read_left = 4;
-
-    }
+    conn.state = State::ReadSecondRequest;
+    conn.read_buf.clear();
 }
 
 fn handle_read_second_request(conn: &mut Conn) {
     let mut buf = [0; 64];
     let socket = &mut conn.socket;
 
-    let mut size = socket.read(&mut buf).unwrap();
-    conn.read_left -= size as isize;
+    let size = socket.read(&mut buf).unwrap();
+    conn.read_buf.put(&buf[0 .. size]);
 
-    if conn.read_left > 0 {
+    if conn.read_buf.len() < 4 {
         return;
     }
 
+    // handle hdr
+
     //let cmd = buf[1];
-    let atyp = buf[3];
+    let atyp = conn.read_buf[3];
     assert_eq!(atyp, 0x1);
 
-    // FIXME bug!
-    conn.read_left += 7;
-    //if conn.read_left == 0;
+    if conn.read_buf.len() < 10 {
+        return;
+    }
 
     let dst_addr = Ipv4Addr::new(buf[4], buf[5], buf[6], buf[7]);
     let dst_port: u16 = BigEndian::read_u16(&[buf[8], buf[9]][..]);
 
     println!("second: {}:{}", dst_addr, dst_port);
+
+    // TODO reply
 }
