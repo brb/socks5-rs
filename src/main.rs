@@ -1,7 +1,3 @@
-// TODO open a connection and monitor it
-// TODO proper state machine
-// TODO thread pool
-
 extern crate mio;
 extern crate bytes;
 
@@ -13,7 +9,9 @@ use std::io::{Read, Write};
 use bytes::{BytesMut, BufMut, ByteOrder, BigEndian};
 use std::io::ErrorKind;
 use std::net::IpAddr::V4;
+use std::rc::Rc;
 
+#[derive(Debug)]
 struct Conn {
     socket: TcpStream,
     remote_socket: Option<TcpStream>,
@@ -21,16 +19,18 @@ struct Conn {
     read_buf: BytesMut,
     write_buf: BytesMut,
     next_event: Event,
+    client_proxy: bool,
 }
 
-#[derive(PartialEq, Clone, Copy)]
+#[derive(PartialEq, Clone, Copy, Debug)]
 enum Event {
     Read,
     Write,
+    Register,
     Nil,
 }
 
-#[derive(PartialEq)]
+#[derive(PartialEq, Debug)]
 enum State {
     ReadFirstRequest,
     WriteFirstReply,
@@ -67,34 +67,63 @@ fn main() {
                     }
                 },
                 token => {
-                    let mut conn = &mut conns.get_mut(&token).unwrap();
+                    let mut insert = false;
+                    let mut to_insert = None;
+                    {
+                        let mut rc_conn = conns.get_mut(&token).unwrap();
+                        {
+                            let mut conn = Rc::get_mut(rc_conn).unwrap();
 
-                    // TODO handle close connection
+                        // TODO handle close connection
+                        match handle_event(conn, event.readiness()) {
+                            Ok(Event::Read) => {
+                                poll.reregister(
+                                    &conn.socket,
+                                    token,
+                                    Ready::readable(),
+                                    PollOpt::edge() | PollOpt::oneshot()
+                                ).unwrap();
+                            },
+                            Ok(Event::Write) => {
+                                poll.reregister(
+                                    &conn.socket,
+                                    token,
+                                    Ready::writable(),
+                                    PollOpt::edge() | PollOpt::oneshot()
+                                ).unwrap();
+                            },
+                            Ok(Event::Register) => {
+                                insert = true;
+                                //poll.register(
+                                //    &conn.remote_socket.unwrap(), token,
+                                //    Ready::readable(), PollOpt::edge() | PollOpt::oneshot()).unwrap();
+                            }
+                            Ok(Event::Nil) => {
+                                panic!("event::nil");
+                            },
+                            Err(_) => {
+                                panic!("err");
+                            },
+                        } // END match
+                        }
+                        if insert == true {
+                            to_insert = Some(rc_conn.clone());
+                        }
+                    }
+                    if insert == true {
+                        let omg = to_insert.unwrap();
+                        if let Some(ref connz) = omg.remote_socket {
+                            next_token_index += 1;
+                            let tokenn = Token(next_token_index);
+                            poll.register(
+                                        connz,
+                                        tokenn,
+                                        Ready::readable(),
+                                        PollOpt::edge() | PollOpt::oneshot()
+                                    ).unwrap();
 
-                    // Trait
-                    match conn.handle_event(event.readiness()) {
-                        Ok(Event::Read) => {
-                            poll.reregister(
-                                &conn.socket,
-                                token,
-                                Ready::readable(),
-                                PollOpt::edge() | PollOpt::oneshot()
-                            ).unwrap();
-                        },
-                        Ok(Event::Write) => {
-                            poll.reregister(
-                                &conn.socket,
-                                token,
-                                Ready::writable(),
-                                PollOpt::edge() | PollOpt::oneshot()
-                            ).unwrap();
-                        },
-                        Ok(Event::Nil) => {
-                            panic!("event::nil");
-                        },
-                        Err(_) => {
-                            panic!("err");
-                        },
+                            conns.insert(tokenn, omg.clone());
+                        }
                     }
                 }
             }
@@ -102,34 +131,32 @@ fn main() {
     }
 }
 
-impl Conn {
-    fn handle_event(&mut self, readiness: Ready) -> Result<Event, &'static str> {
+fn handle_event(conn: &mut Conn, readiness: Ready) -> Result<Event, &'static str> {
         // sanity checks
-        if !(readiness.is_writable() && self.next_event == Event::Write) &&
-            !(readiness.is_readable() && self.next_event == Event::Read) {
+        if !(readiness.is_writable() && conn.next_event == Event::Write) &&
+            !(readiness.is_readable() && conn.next_event == Event::Read) {
                 return Err("wtf");
         }
 
-        match self.state {
+        match conn.state {
             State::ReadFirstRequest =>
-                handle_read_first_request(self),
+                handle_read_first_request(conn),
             State::WriteFirstReply =>
-                handle_write_first_reply(self),
+                handle_write_first_reply(conn),
             State::ReadSecondRequest =>
-                handle_read_second_request(self),
+                handle_read_second_request(conn),
             State::WriteSecondReply =>
-                handle_write_second_reply(self),
+                handle_write_second_reply(conn),
             State::Proxy =>
-                panic!("Proxy"),
+                handle_proxy(conn),
             State::WaitForTerminate =>
                 panic!("NYI"),
         }
 
-        return Ok(self.next_event);
+        return Ok(conn.next_event);
     }
-}
 
-fn accept_connection(server: &TcpListener, token_index: usize, poll: &Poll, conns: &mut HashMap<Token, Conn>) {
+fn accept_connection(server: &TcpListener, token_index: usize, poll: &Poll, conns: &mut HashMap<Token, Rc<Conn>>) {
     let socket = server.accept().unwrap().0;
     let token = Token(token_index);
     poll.register(&socket, token, Ready::readable(), PollOpt::edge() | PollOpt::oneshot()).unwrap();
@@ -141,8 +168,9 @@ fn accept_connection(server: &TcpListener, token_index: usize, poll: &Poll, conn
         read_buf: BytesMut::with_capacity(64),
         write_buf: BytesMut::with_capacity(64),
         next_event: Event::Read,
+        client_proxy: true,
     };
-    conns.insert(token, conn);
+    conns.insert(token, Rc::new(conn));
 }
 
 // TODO trait for states
@@ -236,6 +264,13 @@ fn handle_write_second_reply(conn: &mut Conn) {
     } else {
         panic!("wtf");
     }
+}
+
+fn handle_proxy(conn: &mut Conn) {
+    // read <- client socket
+    // write -> remote socket
+
+
 }
 
 // ---
