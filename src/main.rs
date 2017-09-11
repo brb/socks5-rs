@@ -13,8 +13,10 @@ use std::rc::Rc;
 
 #[derive(Debug)]
 struct Conn {
-    socket: TcpStream,
-    remote_socket: Option<TcpStream>,
+    socket: TcpStream, // client <-> proxy conn
+    token: Token,
+    remote_socket: Option<TcpStream>, // proxy <-> server
+    remote_token: Token,
     state: State,
     read_buf: BytesMut,
     write_buf: BytesMut,
@@ -26,6 +28,7 @@ struct Conn {
 enum Event {
     Read,
     Write,
+    RemoteWrite,
     Register,
     Nil,
 }
@@ -72,10 +75,11 @@ fn main() {
                     {
                         let mut rc_conn = conns.get_mut(&token).unwrap();
                         {
+                            println!("ref count: {}", Rc::strong_count(rc_conn));
                             let mut conn = Rc::get_mut(rc_conn).unwrap();
 
                         // TODO handle close connection
-                        match handle_event(conn, event.readiness()) {
+                        match handle_event(conn, token, event.readiness()) {
                             Ok(Event::Read) => {
                                 poll.reregister(
                                     &conn.socket,
@@ -92,12 +96,25 @@ fn main() {
                                     PollOpt::edge() | PollOpt::oneshot()
                                 ).unwrap();
                             },
+                            Ok(Event::RemoteWrite) => {
+                                if let Some(ref c) = conn.remote_socket {
+                                    poll.reregister(
+                                        c,
+                                        conn.remote_token,
+                                        Ready::writable(),
+                                        PollOpt::edge() | PollOpt::oneshot()
+                                    ).unwrap();
+                                }
+                            },
                             Ok(Event::Register) => {
+                                poll.reregister(
+                                    &conn.socket,
+                                    token,
+                                    Ready::writable(),
+                                    PollOpt::edge() | PollOpt::oneshot()
+                                ).unwrap();
                                 insert = true;
-                                //poll.register(
-                                //    &conn.remote_socket.unwrap(), token,
-                                //    Ready::readable(), PollOpt::edge() | PollOpt::oneshot()).unwrap();
-                            }
+                            },
                             Ok(Event::Nil) => {
                                 panic!("event::nil");
                             },
@@ -106,23 +123,26 @@ fn main() {
                             },
                         } // END match
                         }
-                        if insert == true {
+                        if insert {
+                            {
+                                let mut foo = Rc::get_mut(rc_conn).unwrap();
+                                next_token_index += 1;
+                                foo.remote_token = Token(next_token_index);
+                            }
                             to_insert = Some(rc_conn.clone());
                         }
                     }
-                    if insert == true {
-                        let omg = to_insert.unwrap();
+                    if insert {
+                        let mut omg = to_insert.unwrap();
                         if let Some(ref connz) = omg.remote_socket {
-                            next_token_index += 1;
-                            let tokenn = Token(next_token_index);
+                            conns.insert(omg.remote_token, omg.clone());
                             poll.register(
                                         connz,
-                                        tokenn,
+                                        omg.remote_token,
                                         Ready::readable(),
                                         PollOpt::edge() | PollOpt::oneshot()
                                     ).unwrap();
 
-                            conns.insert(tokenn, omg.clone());
                         }
                     }
                 }
@@ -131,7 +151,7 @@ fn main() {
     }
 }
 
-fn handle_event(conn: &mut Conn, readiness: Ready) -> Result<Event, &'static str> {
+fn handle_event(conn: &mut Conn, token: Token, readiness: Ready) -> Result<Event, &'static str> {
         // sanity checks
         if !(readiness.is_writable() && conn.next_event == Event::Write) &&
             !(readiness.is_readable() && conn.next_event == Event::Read) {
@@ -147,8 +167,10 @@ fn handle_event(conn: &mut Conn, readiness: Ready) -> Result<Event, &'static str
                 handle_read_second_request(conn),
             State::WriteSecondReply =>
                 handle_write_second_reply(conn),
-            State::Proxy =>
-                handle_proxy(conn),
+            State::Proxy => {
+                let is_client_conn: bool = token == conn.token;
+                handle_proxy(conn, is_client_conn, readiness.is_readable());
+            },
             State::WaitForTerminate =>
                 panic!("NYI"),
         }
@@ -163,10 +185,12 @@ fn accept_connection(server: &TcpListener, token_index: usize, poll: &Poll, conn
 
     let conn = Conn{
         socket: socket,
+        token: token,
         remote_socket: None,
+        remote_token: Token(0),
         state: State::ReadFirstRequest,
-        read_buf: BytesMut::with_capacity(64),
-        write_buf: BytesMut::with_capacity(64),
+        read_buf: BytesMut::with_capacity(64 * 1024),
+        write_buf: BytesMut::with_capacity(64 * 1024),
         next_event: Event::Read,
         client_proxy: true,
     };
@@ -257,7 +281,7 @@ fn handle_write_second_reply(conn: &mut Conn) {
             let size = socket.write(&reply).unwrap();
             assert_eq!(size, reply.len());
             conn.state = State::Proxy;
-            conn.next_event = Event::Read;
+            conn.next_event = Event::Register;
         } else {
             panic!("why");
         }
@@ -266,11 +290,19 @@ fn handle_write_second_reply(conn: &mut Conn) {
     }
 }
 
-fn handle_proxy(conn: &mut Conn) {
+fn handle_proxy(conn: &mut Conn, client_conn: bool, is_read: bool) {
     // read <- client socket
     // write -> remote socket
+    println!("yey handle_proxy: {}", client_conn);
 
+    // if is_read { .. }
+    if client_conn && is_read {
+        let socket = &mut conn.socket;
+        read_until_would_block(socket, &mut conn.read_buf).unwrap();
 
+        conn.state = State::Proxy;
+        conn.next_event = Event::RemoteWrite;
+    }
 }
 
 // ---
@@ -282,6 +314,7 @@ fn read_until_would_block(source: &mut Read, buf: &mut BytesMut) -> Result<usize
     loop {
         match source.read(&mut tmp_buf) {
             Ok(size) => {
+                println!("read size: {}", size);
                 buf.put(&tmp_buf[0 .. size]);
                 total_size += size;
             },
