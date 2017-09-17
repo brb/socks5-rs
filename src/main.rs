@@ -1,12 +1,16 @@
+// FSM
+// init -> ... -> handle_proxy
+//
 // TODO handle close connection
 // 1. Make it work
 // 2. Cleanup
 // 3. Multi threaded
+// TODO handle spurious events?
 extern crate mio;
 extern crate bytes;
 
 use std::collections::HashMap;
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, Shutdown};
 use std::io::{Read, Write};
 use std::io::ErrorKind;
 use std::net::IpAddr::V4;
@@ -32,6 +36,7 @@ enum Event {
     RemoteRead,
     RemoteWrite,
     RemoteRegister,
+    EOL,
 }
 
 #[derive(PartialEq, Debug)]
@@ -41,6 +46,8 @@ enum State {
     ReadSecondRequest,
     WriteSecondReply,
     Proxy,
+    Terminate,
+    TerminateRemote,
 }
 
 const SERVER: Token = Token(0);
@@ -62,6 +69,7 @@ fn main() {
         poll.poll(&mut events, None).unwrap();
 
         for event in events.iter() {
+            println!("event: {:?}", event);
             match event.token() {
                 SERVER => {
                     if event.readiness().is_readable() {
@@ -78,6 +86,7 @@ fn main() {
                             panic!("handle_event: {}", e);
                         },
                         Ok(events) => {
+                            println!("returned: {:?}", events);
                             for ev in events {
                                 match ev {
                                     Event::Read => {
@@ -126,6 +135,9 @@ fn main() {
                                             ).unwrap();
                                         }
                                     },
+                                    Event::EOL => {
+                                        // TODO remove from the hashmap
+                                    }
                                 }
                             }
                         },
@@ -144,8 +156,10 @@ fn handle_event(conn: &mut Conn, token: Token, readiness: Ready) -> Result<Vec<E
             State::WriteSecondReply => handle_write_second_reply(conn),
             State::Proxy => {
                 let is_client_conn = token.0 % 2 == 0;
-                handle_proxy(conn, is_client_conn, readiness.is_readable())
+                handle_proxy(conn, is_client_conn, readiness.is_readable(), readiness.is_writable())
             },
+            State::Terminate => handle_terminate(conn),
+            State::TerminateRemote => handle_terminate_remote(conn),
         };
 
         return Ok(events);
@@ -259,21 +273,54 @@ fn handle_write_second_reply(conn: &mut Conn) -> Vec<Event> {
     }
 }
 
-fn handle_proxy(conn: &mut Conn, client_conn: bool, is_read: bool) -> Vec<Event> {
-    println!("handle_proxy: {} {}", client_conn, is_read);
+fn handle_proxy(conn: &mut Conn, client_conn: bool, is_read: bool, is_write: bool) -> Vec<Event> {
+    println!("handle_proxy: {} {} {}", client_conn, is_read, is_write);
     match (client_conn, is_read) {
         (true, true) => {
             let socket = &mut conn.socket;
-            read_until_would_block(socket, &mut conn.read_buf).unwrap();
-            let mut ret = vec![Event::Read];
-            if !conn.already_remote_write {
-                ret.push(Event::RemoteWrite);
-                conn.already_remote_write = true;
+            let mut ret = vec![];
+
+            let (_, eof) = read_until_would_block(socket, &mut conn.read_buf).unwrap();
+            if eof {
+                conn.state = State::Terminate;
+            } else {
+                ret.push(Event::Read);
             }
+
+            if !conn.already_remote_write {
+                    ret.push(Event::RemoteWrite);
+                    conn.already_remote_write = true;
+            }
+
             ret
         },
+        (false, true) => {
+            let mut ret = vec![];
+
+            if let Some(ref mut socket) = conn.remote_socket {
+
+
+                let (size, eof) = read_until_would_block(socket, &mut conn.read_buf).unwrap();
+                if eof {
+                    conn.state = State::TerminateRemote;
+                } else {
+                    ret.push(Event::RemoteRead);
+                }
+
+
+            if !conn.already_write {
+                ret.push(Event::Write);
+                conn.already_write = true;
+            }
+
+            }
+
+            ret
+        },
+
         (true, false) => {
             let socket = &mut conn.socket;
+            // TODO(mp) handle size = 0
             let size = socket.write(&conn.remote_buf).unwrap();
             assert_eq!(size, conn.remote_buf.len());
             conn.remote_buf.clear();
@@ -289,33 +336,55 @@ fn handle_proxy(conn: &mut Conn, client_conn: bool, is_read: bool) -> Vec<Event>
             conn.already_remote_write = false;
             vec![Event::RemoteRead]
         },
-        (false, true) => {
-            // unwrap
-            if let Some(ref mut socket) = conn.remote_socket {
-                read_until_would_block(socket, &mut conn.remote_buf).unwrap();
-            }
-            let mut ret = vec![Event::RemoteRead];
-            if !conn.already_write {
-                ret.push(Event::Write);
-                conn.already_write = true;
-            }
-            ret
-        },
     }
+}
+
+// assert_eq!(event, remote_write)
+fn handle_terminate(conn: &mut Conn) -> Vec<Event> {
+    conn.socket.shutdown(Shutdown::Both).unwrap();
+
+    if let Some(ref mut sock) = conn.remote_socket {
+    let size = sock.write(&conn.remote_buf).unwrap();
+    assert_eq!(size, conn.remote_buf.len());
+    conn.remote_buf.clear();
+
+    sock.shutdown(Shutdown::Both).unwrap();
+    }
+
+    return vec![Event::EOL];
+}
+
+// assert_eq!(event, remote_write)
+fn handle_terminate_remote(conn: &mut Conn) -> Vec<Event> {
+    if let Some(ref mut sock) = conn.remote_socket {
+        sock.shutdown(Shutdown::Both).unwrap();
+    }
+
+    let size = conn.socket.write(&conn.read_buf).unwrap();
+    assert_eq!(size, conn.read_buf.len());
+    conn.read_buf.clear();
+
+    conn.socket.shutdown(Shutdown::Both).unwrap();
+
+    return vec![Event::EOL];
 }
 
 // ---
 
-fn read_until_would_block(source: &mut Read, buf: &mut BytesMut) -> Result<usize, std::io::Error> {
+fn read_until_would_block(source: &mut Read, buf: &mut BytesMut) -> Result<(usize, bool), std::io::Error> {
     let mut total_size = 0;
     let mut tmp_buf = [0; 64];
 
     loop {
         match source.read(&mut tmp_buf) {
+            Ok(0) => {
+                return Ok((total_size, true));
+            },
             Ok(size) => {
                 buf.put(&tmp_buf[0 .. size]);
                 total_size += size;
             },
+            // TODO if size == 0 EOF!
             Err(err) => {
                 if err.kind() == ErrorKind::WouldBlock {
                     // socket is exhausted
@@ -327,5 +396,5 @@ fn read_until_would_block(source: &mut Read, buf: &mut BytesMut) -> Result<usize
         }
     }
 
-    return Ok(total_size);
+    return Ok((total_size, false));
 }
