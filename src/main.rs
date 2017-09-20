@@ -16,13 +16,13 @@ const SERVER_TOKEN: Token = Token(0);
 
 #[derive(PartialEq, Debug)]
 enum State {
-    ReadFirstRequest,
-    WriteFirstReply,
-    ReadSecondRequest,
-    WriteSecondReply,
-    Transfer,
-    Terminate,
-    TerminateRemote,
+    GetAuthMethods,
+    SelectAuthMethod,
+    GetTargetAddr,
+    ReplyTargetAddr,
+    DoProxy,
+    TerminateClient,
+    TerminateTarget,
 }
 
 #[derive(Debug)]
@@ -41,12 +41,12 @@ struct StateData {
 
 #[derive(PartialEq, Clone, Copy, Debug)]
 enum Action {
-    Read,
-    Write,
-    RemoteRad,
-    RemoteWite,
+    ClientRead,
+    ClientWrite,
+    TargetRead,
+    TargetWrite,
     RemoteRegister,
-    EOL,
+    FIN,
 }
 
 fn main() {
@@ -74,70 +74,76 @@ fn main() {
                 },
                 token => {
                     let real_token = Token(token.0 + (token.0 % 2)); // get original token
-                    let mut conn = states.get_mut(&real_token).unwrap();
+                    let mut st = states.get_mut(&real_token).unwrap();
 
-                    match conn.handle_event(token, event.readiness()) {
+                    match st.handle_event(token, event.readiness()) {
                         Err(e) => {
                             panic!("handle_event returned error: {:?}", e);
                         },
-                        Ok(events) => {
-                            for ev in events {
-                                match ev {
-                                    Action::Read => {
-                                        poll.reregister(
-                                            &conn.client_socket,
-                                            real_token,
-                                            Ready::readable(),
-                                            PollOpt::edge() | PollOpt::oneshot()
-                                        ).unwrap();
-                                    },
-                                    Action::Write => {
-                                        poll.reregister(
-                                            &conn.client_socket,
-                                            real_token,
-                                            Ready::writable(),
-                                            PollOpt::edge() | PollOpt::oneshot()
-                                        ).unwrap();
-                                    },
-                                    Action::RemoteRad => {
-                                        if let Some(ref client_socket) = conn.target_socket {
-                                            poll.reregister(
-                                                client_socket,
-                                                Token(real_token.0 - 1),
-                                                Ready::readable(),
-                                                PollOpt::edge() | PollOpt::oneshot()
-                                            ).unwrap();
-                                        }
-                                    },
-                                    Action::RemoteWite => {
-                                        if let Some(ref client_socket) = conn.target_socket {
-                                            poll.reregister(
-                                                client_socket,
-                                                Token(real_token.0 - 1),
-                                                Ready::writable(),
-                                                PollOpt::edge() | PollOpt::oneshot()
-                                            ).unwrap();
-                                        }
-                                    },
-                                    Action::RemoteRegister => {
-                                        if let Some(ref client_socket) = conn.target_socket {
-                                            poll.register(
-                                                client_socket,
-                                                Token(real_token.0 - 1),
-                                                Ready::readable(),
-                                                PollOpt::edge() | PollOpt::oneshot()
-                                            ).unwrap();
-                                        }
-                                    },
-                                    Action::EOL => {
-                                        // TODO remove from the hashmap
-                                    }
-                                }
+                        Ok(actions) => {
+                            for a in actions {
+                                handle_action(a, real_token, st, &poll);
                             }
                         },
                     }
                 }
             }
+        }
+    }
+}
+
+fn handle_action(action: Action, token: Token, st: &mut StateData, poll: &mio::Poll) {
+    let real_token = Token(token.0 + (token.0 % 2)); // get original token
+
+    match action {
+        Action::ClientRead => {
+            poll.reregister(
+                    &st.client_socket,
+                    real_token,
+                    Ready::readable(),
+                    PollOpt::edge() | PollOpt::oneshot()
+                    ).unwrap();
+        },
+        Action::ClientWrite => {
+            poll.reregister(
+                    &st.client_socket,
+                    real_token,
+                    Ready::writable(),
+                    PollOpt::edge() | PollOpt::oneshot()
+                    ).unwrap();
+        },
+        Action::TargetRead => {
+            if let Some(ref client_socket) = st.target_socket {
+                poll.reregister(
+                        client_socket,
+                        Token(real_token.0 - 1),
+                        Ready::readable(),
+                        PollOpt::edge() | PollOpt::oneshot()
+                        ).unwrap();
+            }
+        },
+        Action::TargetWrite => {
+            if let Some(ref client_socket) = st.target_socket {
+                poll.reregister(
+                        client_socket,
+                        Token(real_token.0 - 1),
+                        Ready::writable(),
+                        PollOpt::edge() | PollOpt::oneshot()
+                        ).unwrap();
+            }
+        },
+        Action::RemoteRegister => {
+            if let Some(ref client_socket) = st.target_socket {
+                poll.register(
+                        client_socket,
+                        Token(real_token.0 - 1),
+                        Ready::readable(),
+                        PollOpt::edge() | PollOpt::oneshot()
+                        ).unwrap();
+            }
+        },
+        Action::FIN => {
+            // TODO remove from the hashmap
         }
     }
 }
@@ -149,19 +155,16 @@ struct Event {
 
 impl StateData {
     fn handle_event(&mut self, token: Token, readiness: Ready) -> Result<Vec<Action>, ()> {
-
         let ev = Event{token, readiness};
-
         let actions = match self.state_name {
-            State::ReadFirstRequest =>  st_read_first_request(ev, self),
-            State::WriteFirstReply =>   st_write_first_reply(ev, self),
-            State::ReadSecondRequest => st_read_second_request(ev, self),
-            State::WriteSecondReply =>  st_write_second_reply(ev, self),
-            State::Transfer =>          st_proxy(ev, self),
-            State::Terminate =>         st_terminate(ev, self),
-            State::TerminateRemote =>   st_terminate_remote(ev, self),
+            State::GetAuthMethods =>  st_get_auth_methods(ev, self),
+            State::SelectAuthMethod =>   st_select_auth_method(ev, self),
+            State::GetTargetAddr => st_get_target_addr(ev, self),
+            State::ReplyTargetAddr =>  st_reply_target_addr(ev, self),
+            State::DoProxy =>          st_do_proxy(ev, self),
+            State::TerminateClient =>         st_terminate_client(ev, self),
+            State::TerminateTarget =>   st_terminate_target(ev, self),
         };
-
         return Ok(actions);
     }
 }
@@ -171,132 +174,123 @@ fn accept_connection(server: &TcpListener, token_index: usize, poll: &Poll, stat
     let token = Token(token_index);
     poll.register(&client_socket, token, Ready::readable(), PollOpt::edge() | PollOpt::oneshot()).unwrap();
 
-    let conn = StateData{
+    let st = StateData{
         client_socket: client_socket,
         target_socket: None,
-        state_name: State::ReadFirstRequest,
+        state_name: State::GetAuthMethods,
         client_buf: BytesMut::with_capacity(64 * 1024),
         target_buf: BytesMut::with_capacity(64 * 1024),
         has_client_write: false,
         has_target_write: false,
     };
-    states.insert(token, conn);
+    states.insert(token, st);
 }
 
 // States
 
-// TODO trait for states
+fn st_get_auth_methods(_: Event, st: &mut StateData) -> Vec<Action> {
+    let client_socket = &mut st.client_socket;
 
-fn st_read_first_request(_: Event, conn: &mut StateData) -> Vec<Action> {
-    let client_socket = &mut conn.client_socket;
-    read_until_would_block(client_socket, &mut conn.client_buf).unwrap();
-
-    let len = conn.client_buf.len();
-    if len < 2 || len < conn.client_buf[1] as usize + 2 {
-        return vec![Action::Read];
+    read_until_would_block(client_socket, &mut st.client_buf).unwrap();
+    let len = st.client_buf.len();
+    if len < 2 || len < st.client_buf[1] as usize + 2 {
+        return vec![Action::ClientRead];
     }
 
-    conn.state_name = State::WriteFirstReply;
-    conn.client_buf.clear();
+    // TODO do sanity checks: SOCKS version, valid methods
 
-    return vec![Action::Write];
+    st.state_name = State::SelectAuthMethod;
+    st.client_buf.clear();
+
+    return vec![Action::ClientWrite];
 }
 
-fn st_write_first_reply(_: Event, conn: &mut StateData) -> Vec<Action> {
-    let client_socket = &mut conn.client_socket;
-    let reply = [5, 0];
+fn st_select_auth_method(_: Event, st: &mut StateData) -> Vec<Action> {
+    let client_socket = &mut st.client_socket;
+    let reply = [5, 0]; // "0" = no auth
 
     write_and_flush(client_socket, &reply);
-    conn.state_name = State::ReadSecondRequest;
+    st.state_name = State::GetTargetAddr;
 
-    return vec![Action::Read];
+    return vec![Action::ClientRead];
 }
 
-fn st_read_second_request(_: Event, conn: &mut StateData) -> Vec<Action> {
-    let client_socket = &mut conn.client_socket;
-    read_until_would_block(client_socket, &mut conn.client_buf).unwrap();
+fn st_get_target_addr(_: Event, st: &mut StateData) -> Vec<Action> {
+    let client_socket = &mut st.client_socket;
+    read_until_would_block(client_socket, &mut st.client_buf).unwrap();
 
-    if conn.client_buf.len() < 4 {
-        return vec![Action::Read];
+    if st.client_buf.len() < 4 {
+        return vec![Action::ClientRead];
     }
 
-    // handle hdr
-    let cmd = conn.client_buf[1];
-    assert_eq!(cmd, 0x1); // CONNECT
+    let cmd = st.client_buf[1];
+    assert_eq!(cmd, 0x1); // CMD CONNECT
 
-    //let cmd = buf[1];
-    let atyp = conn.client_buf[3];
-    assert_eq!(atyp, 0x1);
+    let atyp = st.client_buf[3];
+    assert_eq!(atyp, 0x1); // ATYP IPv4
 
-    if conn.client_buf.len() < 10 {
-        return vec![Action::Read];
+    if st.client_buf.len() < 10 {
+        return vec![Action::ClientRead];
     }
 
     let target_addr = IpAddr::V4(Ipv4Addr::new(
-        conn.client_buf[4], conn.client_buf[5],
-        conn.client_buf[6], conn.client_buf[7]
+        st.client_buf[4], st.client_buf[5],
+        st.client_buf[6], st.client_buf[7]
     ));
     let target_port: u16 = BigEndian::read_u16(
-        &[conn.client_buf[8], conn.client_buf[9]][..]
+        &[st.client_buf[8], st.client_buf[9]][..]
     );
+    let target_socket = TcpStream::connect(&SocketAddr::new(target_addr, target_port)).unwrap();
+    st.target_socket = Some(target_socket);
 
-    let s = TcpStream::connect(&SocketAddr::new(target_addr, target_port)).unwrap();
-    conn.target_socket = Some(s);
+    st.state_name = State::ReplyTargetAddr;
+    st.client_buf.clear();
 
-    conn.state_name = State::WriteSecondReply;
-    conn.client_buf.clear();
-
-    return vec![Action::Write];
+    return vec![Action::ClientWrite];
 }
 
-fn st_write_second_reply(_: Event, conn: &mut StateData) -> Vec<Action> {
-    let client_socket = &mut conn.client_socket;
+fn st_reply_target_addr(_: Event, st: &mut StateData) -> Vec<Action> {
+    let client_socket = &mut st.client_socket;
 
-    if let Some(ref target_socket) = conn.target_socket {
-        let remote_addr = target_socket.local_addr().unwrap();
-        if let V4(addr) = remote_addr.ip() {
-            let port = remote_addr.port();
-            let tmp = addr.octets();
+    if let Some(ref target_socket) = st.target_socket {
+        let addr = target_socket.local_addr().unwrap();
+        if let V4(ip) = addr.ip() {
+            let port = addr.port();
+            let tmp = ip.octets();
             let reply = [
                 5, 0, 0, 1,
                 tmp[0], tmp[1], tmp[2], tmp[3], // IP
                 (port >> 8) as u8, port as u8 // Port
             ];
-
             write_and_flush(client_socket, &reply);
-            conn.state_name = State::Transfer;
 
-            return vec![Action::Read, Action::RemoteRegister, Action::RemoteRad];
-        } else {
-            panic!("why");
+            st.state_name = State::DoProxy;
+
+            return vec![Action::ClientRead, Action::RemoteRegister, Action::TargetRead];
         }
-    } else {
-        panic!("wtf");
     }
+
+    panic!("should not happen");
 }
 
-fn st_proxy(ev: Event, conn: &mut StateData) -> Vec<Action> {
+fn st_do_proxy(ev: Event, st: &mut StateData) -> Vec<Action> {
+    let client_st = ev.token.0 % 2 == 0;
 
-    let client_conn = ev.token.0 % 2 == 0;
-    let is_read = ev.readiness.is_readable();
-    let is_write = ev.readiness.is_writable();
-            //st_proxy(st, is_client_st, readiness.is_readable(), readiness.is_writable())
-    println!("st_proxy: {} {} {}", client_conn, is_read, is_write);
-    match (client_conn, is_read) {
+    match (client_st, ev.readiness.is_readable()) {
         (true, true) => {
-            let client_socket = &mut conn.client_socket;
+            let client_socket = &mut st.client_socket;
             let mut ret = vec![];
 
-            let (_, eof) = read_until_would_block(client_socket, &mut conn.client_buf).unwrap();
+            let (_, eof) = read_until_would_block(client_socket, &mut st.client_buf).unwrap();
             if eof {
-                conn.state_name = State::Terminate;
+                st.state_name = State::TerminateClient;
             } else {
-                ret.push(Action::Read);
+                ret.push(Action::ClientRead);
             }
 
-            if !conn.has_target_write {
-                    ret.push(Action::RemoteWite);
-                    conn.has_target_write = true;
+            if !st.has_target_write {
+                    ret.push(Action::TargetWrite);
+                    st.has_target_write = true;
             }
 
             ret
@@ -304,20 +298,20 @@ fn st_proxy(ev: Event, conn: &mut StateData) -> Vec<Action> {
         (false, true) => {
             let mut ret = vec![];
 
-            if let Some(ref mut client_socket) = conn.target_socket {
+            if let Some(ref mut client_socket) = st.target_socket {
 
 
-                let (_, eof) = read_until_would_block(client_socket, &mut conn.client_buf).unwrap();
+                let (_, eof) = read_until_would_block(client_socket, &mut st.client_buf).unwrap();
                 if eof {
-                    conn.state_name = State::TerminateRemote;
+                    st.state_name = State::TerminateTarget;
                 } else {
-                    ret.push(Action::RemoteRad);
+                    ret.push(Action::TargetRead);
                 }
 
 
-            if !conn.has_client_write {
-                ret.push(Action::Write);
-                conn.has_client_write = true;
+            if !st.has_client_write {
+                ret.push(Action::ClientWrite);
+                st.has_client_write = true;
             }
 
             }
@@ -326,48 +320,50 @@ fn st_proxy(ev: Event, conn: &mut StateData) -> Vec<Action> {
         },
 
         (true, false) => {
-            let client_socket = &mut conn.client_socket;
+            let client_socket = &mut st.client_socket;
             // TODO(mp) handle size = 0
-            write_and_flush(client_socket, &conn.target_buf);
-            conn.target_buf.clear();
-            conn.has_client_write = false;
-            vec![Action::Read]
+            write_and_flush(client_socket, &st.target_buf);
+            st.target_buf.clear();
+            st.has_client_write = false;
+            vec![Action::ClientRead]
         },
         (false, false) => {
-            if let Some(ref mut client_socket) = conn.target_socket {
-                write_and_flush(client_socket, &conn.client_buf);
-                conn.client_buf.clear();
+            if let Some(ref mut client_socket) = st.target_socket {
+                write_and_flush(client_socket, &st.client_buf);
+                st.client_buf.clear();
             }
-            conn.has_target_write = false;
-            vec![Action::RemoteRad]
+            st.has_target_write = false;
+            vec![Action::TargetRead]
         },
     }
 }
 
-// assert_eq!(event, remote_write)
-fn st_terminate(_: Event, conn: &mut StateData) -> Vec<Action> {
-    conn.client_socket.shutdown(Shutdown::Both).unwrap();
+fn st_terminate_client(ev: Event, st: &mut StateData) -> Vec<Action> {
+    assert!(ev.readiness.is_writable());
 
-    if let Some(ref mut sock) = conn.target_socket {
-        write_and_flush(sock, &conn.target_buf);
-        conn.target_buf.clear();
+    st.client_socket.shutdown(Shutdown::Both).unwrap();
+
+    if let Some(ref mut sock) = st.target_socket {
+        write_and_flush(sock, &st.target_buf);
+        st.target_buf.clear();
         sock.shutdown(Shutdown::Both).unwrap();
     }
 
-    return vec![Action::EOL];
+    return vec![Action::FIN];
 }
 
-// assert_eq!(event, remote_write)
-fn st_terminate_remote(_: Event, conn: &mut StateData) -> Vec<Action> {
-    if let Some(ref mut sock) = conn.target_socket {
+fn st_terminate_target(ev: Event, st: &mut StateData) -> Vec<Action> {
+    assert!(ev.readiness.is_writable());
+
+    if let Some(ref mut sock) = st.target_socket {
         sock.shutdown(Shutdown::Both).unwrap();
     }
 
-    write_and_flush(&mut conn.client_socket, &conn.client_buf);
-    conn.client_buf.clear();
-    conn.client_socket.shutdown(Shutdown::Both).unwrap();
+    write_and_flush(&mut st.client_socket, &st.client_buf);
+    st.client_buf.clear();
+    st.client_socket.shutdown(Shutdown::Both).unwrap();
 
-    return vec![Action::EOL];
+    return vec![Action::FIN];
 }
 
 // ---
