@@ -14,6 +14,17 @@ use mio::tcp::{TcpListener, TcpStream};
 const LADDR: &'static str = "127.0.0.1:1080";
 const SERVER_TOKEN: Token = Token(0);
 
+#[derive(PartialEq, Debug)]
+enum State {
+    ReadFirstRequest,
+    WriteFirstReply,
+    ReadSecondRequest,
+    WriteSecondReply,
+    Transfer,
+    Terminate,
+    TerminateRemote,
+}
+
 #[derive(Debug)]
 struct StateData {
     client_socket: TcpStream,
@@ -26,17 +37,6 @@ struct StateData {
     has_target_write: bool,
 
     state: State, // TODO
-}
-
-#[derive(PartialEq, Debug)]
-enum State {
-    ReadFirstRequest,
-    WriteFirstReply,
-    ReadSecondRequest,
-    WriteSecondReply,
-    Transfer,
-    Terminate,
-    TerminateRemote,
 }
 
 #[derive(PartialEq, Clone, Copy, Debug)]
@@ -76,9 +76,9 @@ fn main() {
                     let real_token = Token(token.0 + (token.0 % 2)); // get original token
                     let mut conn = conns.get_mut(&real_token).unwrap();
 
-                    match handle_event(conn, token, event.readiness()) {
+                    match dispatch_event(conn, token, event.readiness()) {
                         Err(e) => {
-                            panic!("handle_event: {}", e);
+                            panic!("dispatch_event: {}", e);
                         },
                         Ok(events) => {
                             println!("returned: {:?}", events);
@@ -143,7 +143,7 @@ fn main() {
     }
 }
 
-fn handle_event(conn: &mut StateData, token: Token, readiness: Ready) -> Result<Vec<Action>, &'static str> {
+fn dispatch_event(conn: &mut StateData, token: Token, readiness: Ready) -> Result<Vec<Action>, &'static str> {
         let events = match conn.state {
             State::ReadFirstRequest => handle_read_first_request(conn),
             State::WriteFirstReply => handle_write_first_reply(conn),
@@ -197,9 +197,8 @@ fn handle_read_first_request(conn: &mut StateData) -> Vec<Action> {
 fn handle_write_first_reply(conn: &mut StateData) -> Vec<Action> {
     let client_socket = &mut conn.client_socket;
     let reply = [5, 0];
-    let size = client_socket.write(&reply).unwrap();
-    assert_eq!(size, reply.len());
 
+    write_and_flush(client_socket, &reply);
     conn.state = State::ReadSecondRequest;
 
     return vec![Action::Read];
@@ -255,8 +254,8 @@ fn handle_write_second_reply(conn: &mut StateData) -> Vec<Action> {
                 tmp[0], tmp[1], tmp[2], tmp[3], // IP
                 (port >> 8) as u8, port as u8 // Port
             ];
-            let size = client_socket.write(&reply).unwrap();
-            assert_eq!(size, reply.len());
+
+            write_and_flush(client_socket, &reply);
             conn.state = State::Transfer;
 
             return vec![Action::Read, Action::RemoteRegister, Action::RemoteRad];
@@ -316,16 +315,14 @@ fn handle_proxy(conn: &mut StateData, client_conn: bool, is_read: bool, is_write
         (true, false) => {
             let client_socket = &mut conn.client_socket;
             // TODO(mp) handle size = 0
-            let size = client_socket.write(&conn.target_buf).unwrap();
-            assert_eq!(size, conn.target_buf.len());
+            write_and_flush(client_socket, &conn.target_buf);
             conn.target_buf.clear();
             conn.has_client_write = false;
             vec![Action::Read]
         },
         (false, false) => {
             if let Some(ref mut client_socket) = conn.target_socket {
-                let size = client_socket.write(&conn.client_buf).unwrap();
-                assert_eq!(size, conn.client_buf.len());
+                write_and_flush(client_socket, &conn.client_buf);
                 conn.client_buf.clear();
             }
             conn.has_target_write = false;
@@ -339,11 +336,9 @@ fn handle_terminate(conn: &mut StateData) -> Vec<Action> {
     conn.client_socket.shutdown(Shutdown::Both).unwrap();
 
     if let Some(ref mut sock) = conn.target_socket {
-    let size = sock.write(&conn.target_buf).unwrap();
-    assert_eq!(size, conn.target_buf.len());
-    conn.target_buf.clear();
-
-    sock.shutdown(Shutdown::Both).unwrap();
+        write_and_flush(sock, &conn.target_buf);
+        conn.target_buf.clear();
+        sock.shutdown(Shutdown::Both).unwrap();
     }
 
     return vec![Action::EOL];
@@ -355,8 +350,8 @@ fn handle_terminate_remote(conn: &mut StateData) -> Vec<Action> {
         sock.shutdown(Shutdown::Both).unwrap();
     }
 
-    write_and_flush(&mut conn.client_socket, &mut conn.client_buf);
-
+    write_and_flush(&mut conn.client_socket, &conn.client_buf);
+    conn.client_buf.clear();
     conn.client_socket.shutdown(Shutdown::Both).unwrap();
 
     return vec![Action::EOL];
@@ -364,11 +359,10 @@ fn handle_terminate_remote(conn: &mut StateData) -> Vec<Action> {
 
 // ---
 
-fn write_and_flush(dst: &mut Write, buf: &mut BytesMut) {
+fn write_and_flush(dst: &mut Write, buf: &[u8]) {
     let size = dst.write(&buf).unwrap();
     assert_eq!(size, buf.len());
     dst.flush().unwrap();
-    buf.clear();
 }
 
 fn read_until_would_block(src: &mut Read, buf: &mut BytesMut) -> Result<(usize, bool), std::io::Error> {
