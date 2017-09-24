@@ -276,28 +276,25 @@ fn st_reply_target_addr(_: Event, st: &mut StateData) -> Vec<Action> {
 fn st_do_proxy(ev: Event, st: &mut StateData) -> Vec<Action> {
     let client_st = ev.token.0 % 2 == 0;
 
+    let mut actions = vec![];
+
     match (client_st, ev.readiness.is_readable()) {
         (true, true) => {
             let client_socket = &mut st.client_socket;
-            let mut ret = vec![];
 
             let (_, eof) = read_until_would_block(client_socket, &mut st.client_buf).unwrap();
             if eof {
                 st.state_name = State::TerminateClient;
             } else {
-                ret.push(Action::ClientRead);
+                actions.push(Action::ClientRead);
             }
 
             if !st.has_target_write {
-                    ret.push(Action::TargetWrite);
+                    actions.push(Action::TargetWrite);
                     st.has_target_write = true;
             }
-
-            ret
         },
         (false, true) => {
-            let mut ret = vec![];
-
             if let Some(ref mut client_socket) = st.target_socket {
 
 
@@ -305,18 +302,16 @@ fn st_do_proxy(ev: Event, st: &mut StateData) -> Vec<Action> {
                 if eof {
                     st.state_name = State::TerminateTarget;
                 } else {
-                    ret.push(Action::TargetRead);
+                    actions.push(Action::TargetRead);
                 }
 
 
             if !st.has_client_write {
-                ret.push(Action::ClientWrite);
+                actions.push(Action::ClientWrite);
                 st.has_client_write = true;
             }
 
             }
-
-            ret
         },
 
         (true, false) => {
@@ -325,7 +320,7 @@ fn st_do_proxy(ev: Event, st: &mut StateData) -> Vec<Action> {
             write_and_flush(client_socket, &st.target_buf);
             st.target_buf.clear();
             st.has_client_write = false;
-            vec![Action::ClientRead]
+            actions.push(Action::ClientRead);
         },
         (false, false) => {
             if let Some(ref mut client_socket) = st.target_socket {
@@ -333,9 +328,11 @@ fn st_do_proxy(ev: Event, st: &mut StateData) -> Vec<Action> {
                 st.client_buf.clear();
             }
             st.has_target_write = false;
-            vec![Action::TargetRead]
+            actions.push(Action::TargetRead);
         },
     }
+
+    return actions;
 }
 
 fn st_terminate_client(ev: Event, st: &mut StateData) -> Vec<Action> {
