@@ -1,6 +1,7 @@
 // multithreaded macros
 extern crate mio;
 extern crate bytes;
+extern crate socks5_rs;
 
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, Shutdown};
@@ -10,6 +11,7 @@ use std::net::IpAddr::V4;
 use bytes::{BytesMut, BufMut, ByteOrder, BigEndian};
 use mio::*;
 use mio::tcp::{TcpListener, TcpStream};
+use socks5_rs::WorkersPool;
 
 const LADDR: &'static str = "127.0.0.1:1080";
 const SERVER_TOKEN: Token = Token(0);
@@ -50,6 +52,8 @@ enum Action {
 }
 
 fn main() {
+    let poll = WorkersPool::new(3);
+    poll.exec(|| println!("omg"));
     let mut next_token_index = 0;
     let mut states = HashMap::new();
 
