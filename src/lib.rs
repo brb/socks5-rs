@@ -1,6 +1,9 @@
 use std::thread;
 use std::sync::{mpsc, Mutex, Arc};
 
+pub mod thc;
+
+// why would you use Box(...) ?
 pub struct WorkersPool<T> {
     tx: mpsc::Sender<T>,
 }

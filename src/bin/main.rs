@@ -12,6 +12,7 @@ use bytes::{BytesMut, BufMut, ByteOrder, BigEndian};
 use mio::*;
 use mio::tcp::{TcpListener, TcpStream};
 use socks5_rs::WorkersPool;
+use socks5_rs::thc;
 
 const LADDR: &'static str = "127.0.0.1:1080";
 const SERVER_TOKEN: Token = Token(0);
@@ -51,9 +52,17 @@ enum Action {
     FIN,
 }
 
+// TcpStream (token)
+// Fsm::new() -> {StateName, Action :: {read, Token} _BytesCount} | {read, count} {write, Reply, Token} | {register, TcpStream, Token} | {terminate, Token}
+// fsm.handle_event({read, Token, Bytes} | {writ
+//
+// let mut thc = TcpHandler::new(pool_size);
+// thc.register(port, ???FSM???).unwrap(); // FSM_builder
+// thc.run().unwrap();
+
 fn main() {
-    let poll = WorkersPool::new(3);
-    poll.exec(|| println!("omg"));
+    let th = thc::TcpHandler::new(4);
+    let pool = WorkersPool::new(3);
     let mut next_token_index = 0;
     let mut states = HashMap::new();
 
@@ -80,6 +89,8 @@ fn main() {
                     let real_token = Token(token.0 + (token.0 % 2)); // get original token
                     let mut st = states.get_mut(&real_token).unwrap();
 
+                    pool.exec(|| { println!("yey"); });
+
                     match st.handle_event(token, event.readiness()) {
                         Err(e) => {
                             panic!("handle_event returned error: {:?}", e);
@@ -90,6 +101,7 @@ fn main() {
                             }
                         },
                     }
+                    //});
                 }
             }
         }
