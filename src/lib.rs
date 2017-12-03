@@ -17,8 +17,10 @@ impl<T> WorkersPool<T> where T: FnOnce() + Send + 'static {
             let rx = chan.clone();
 
             thread::spawn(move || {
-                let f = rx.lock().unwrap().recv().unwrap();
-                f();
+                loop {
+                    let f = rx.lock().unwrap().recv().unwrap();
+                    f();
+                }
             });
 
         }
@@ -38,7 +40,7 @@ mod tests {
 
     #[test]
     fn exec() {
-        let p = WorkersPool::new(5);
+        let p = WorkersPool::new(2);
         let counter = Arc::new(Mutex::new(0));
 
         for i in 1..5 {
