@@ -27,11 +27,11 @@ impl FSM for Socks5 {
     fn init(&mut self) -> Return {
         self.state = 1;
         println!("socks5: init");
-        Return::Read(2)
+        Return::ReadExact(0, 2)
     }
 
     fn handle_event(&mut self, ev: Event) -> Return {
         println!("event: {:?}", ev);
-        Return::Read(0)
+        Return::ReadExact(0, 2)
     }
 }

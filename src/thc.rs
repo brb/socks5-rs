@@ -3,13 +3,17 @@ extern crate bytes;
 
 use std::net::SocketAddr;
 use std::cell::RefCell;
+use std::rc::Rc;
 use std::collections::HashMap;
 use self::mio::{Poll, Events, Token, PollOpt, Ready}; // TODO self, ugh?
 use self::mio::tcp::{TcpListener, TcpStream};
 use self::bytes::{BytesMut, Bytes};
 
-struct FsmState {
-
+struct FsmConn {
+    conn_ref: Ref,
+    read_buf: BytesMut,
+    write_buf: BytesMut,
+    fsm: Rc<RefCell<Box<FSM>>>,
 }
 
 struct Acceptor {
@@ -24,9 +28,8 @@ pub struct TcpHandler {
 
     acceptors: HashMap<Token, RefCell<Acceptor>>,
 
-    fsms: HashMap<Token, Box<FSM>>,
-
-    // token -> fsm_id, ref
+    refs: RefCell<HashMap<Token, Ref>>,
+    fsms: RefCell<HashMap<Token, FsmConn>>,
 }
 
 impl TcpHandler {
@@ -36,8 +39,8 @@ impl TcpHandler {
             next_token_index: RefCell::new(0),
             acceptors: HashMap::new(),
 
-            //token_to_fsm_ref: HashMap::new(),
-            fsms: HashMap::new(),
+            refs: RefCell::new(HashMap::new()),
+            fsms: RefCell::new(HashMap::new()),
         }
     }
 
@@ -59,7 +62,8 @@ impl TcpHandler {
             for event in &events {
                 if let Some(acceptor) = self.acceptors.get(&event.token()) {
                     self.accept_connection(&acceptor.borrow());
-                } else if let Some(fsm) = self.fsms.get(&event.token()) {
+                } else { //if let Some(fsm) = self.fsms.get(&event.token()) {
+                    panic!("nyi");
                     // TODO which Ref?
 
                 }
@@ -72,13 +76,21 @@ impl TcpHandler {
 
         let token = Token(*self.next_token_index.borrow());
         *self.next_token_index.borrow_mut() += 1;
-
         self.poll.register(&socket, token, Ready::readable(), PollOpt::edge() | PollOpt::oneshot()).unwrap();
 
-        let mut fsm = (acceptor.spawn)();
+        let fsm = Rc::new(RefCell::new((acceptor.spawn)()));
 
-        //self.fsms.insert(token, fsm);
+        //self.refs.borrow_mut().insert(token, 0);
+        let fsm_conn = FsmConn{
+            conn_ref: 0,
+            read_buf: BytesMut::with_capacity(64 * 1024),
+            write_buf: BytesMut::with_capacity(64 * 1024),
+            fsm: fsm.clone(),
+        };
+        self.fsms.borrow_mut().insert(token, fsm_conn);
 
+        let fsm = fsm.clone();
+        let mut fsm = fsm.borrow_mut();
         let ret = fsm.init();
         self.handle_ret(ret).unwrap();
     }
@@ -99,13 +111,13 @@ pub enum Event {
 
 #[derive(Debug)]
 pub enum Return {
-    Read(Ref),
+    //Read(Ref),
     ReadExact(Ref, usize),
-    ReadAndWrite(Ref, Bytes),
-    ReadExactAndWrite(Ref, usize, Bytes),
-    Terminate(Ref),
-    TerminateAndWrite(Ref, Bytes),
-    Register(Ref, TcpStream),
+    //ReadAndWrite(Ref, Bytes),
+    //ReadExactAndWrite(Ref, usize, Bytes),
+    //Terminate(Ref),
+    //TerminateAndWrite(Ref, Bytes),
+    //Register(Ref, TcpStream),
 }
 
 pub trait FSM {
