@@ -1,3 +1,4 @@
+// TODO .clone -> Rc::clone
 extern crate mio;
 extern crate bytes;
 
@@ -12,7 +13,7 @@ use self::bytes::{BytesMut, Bytes, BufMut};
 
 struct FsmConn {
     conn_ref: ConnRef,
-    socket: TcpStream,
+    socket: Rc<TcpStream>,
     read_buf: BytesMut,
     req_read_count: usize,
     write_buf: BytesMut,
@@ -75,13 +76,13 @@ impl TcpHandler {
 
         let token = Token(*self.next_token_index.borrow());
         *self.next_token_index.borrow_mut() += 1;
-        self.poll.register(&socket, token, Ready::readable(), PollOpt::edge() | PollOpt::oneshot()).unwrap();
 
         let fsm = Rc::new(RefCell::new((acceptor.spawn)()));
+        let socket = Rc::new(socket);
 
-        let fsm_conn = FsmConn{
-            conn_ref: 0,
-            socket: socket,
+        let mut fsm_conn = FsmConn{
+            conn_ref: 0, // indicates the main connection
+            socket: Rc::clone(&socket),
             read_buf: BytesMut::with_capacity(64 * 1024),
             req_read_count: 0,
             write_buf: BytesMut::with_capacity(64 * 1024),
@@ -91,24 +92,22 @@ impl TcpHandler {
 
         let fsm = fsm.clone();
         let mut fsm = fsm.borrow_mut();
-        let mut ret = fsm.init();
 
-        // TODO bah ->
-        loop {
-            println!("loop");
-            let ev = self.handle_ret(ret);
-            match ev {
-                Event::None => break,
-                _ => ret = fsm.handle_event(ev),
-            }
+        // Currently we support only the ReadExact(0, <..>) return
+        if let Return::ReadExact(0, count) = fsm.init() {
+            fsm_conn.req_read_count = count;
+            self.poll.register(&*socket, token, Ready::readable(), PollOpt::edge() | PollOpt::oneshot()).unwrap();
+        } else {
+            panic!("NYI");
         }
     }
 
-    fn handle_ret(&self, ret: Return) -> Event {
+    fn handle_ret(&self, ret: Return) {
         match ret {
-            Return::ReadExact(conn_ref, n) => {
-                // TODO set n!
-                Event::None
+            Return::ReadExact(conn_ref, count) => {
+                //self.poll.
+                // <--------->
+
                 // if buf len is n, return call
             }
         }
@@ -116,7 +115,9 @@ impl TcpHandler {
 
     fn handle_event(&self, ready: Ready, fsm_conn: &mut FsmConn) {
         if ready.is_readable() {
-            let (_, terminate) = read_until_would_block(&mut fsm_conn.socket, &mut fsm_conn.read_buf).unwrap();
+            let socket = Rc::get_mut(&mut fsm_conn.socket).unwrap();
+            let (_, terminate) = read_until_would_block(socket, &mut fsm_conn.read_buf).unwrap();
+            // TODO what if req_read_count == 0?
             if fsm_conn.read_buf.len() >= fsm_conn.req_read_count {
 
                 let buf = fsm_conn.read_buf.split_to(fsm_conn.req_read_count);
