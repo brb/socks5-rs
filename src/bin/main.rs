@@ -8,14 +8,12 @@ const LADDR: &'static str = "127.0.0.1:1080";
 
 fn main() {
     let mut tcp_handler = thc::TcpHandler::new(4);
-
     let addr = LADDR.parse().unwrap();
     fn builder() -> Box<FSM> {
         let s = Socks5{state: 0};
         Box::new(s)
     };
     tcp_handler.register(&addr, builder);
-
     tcp_handler.run().unwrap();
 }
 

@@ -5,15 +5,19 @@ use std::net::SocketAddr;
 use std::cell::RefCell;
 use std::rc::Rc;
 use std::collections::HashMap;
+use std::io::{Read, Error, ErrorKind};
 use self::mio::{Poll, Events, Token, PollOpt, Ready}; // TODO self, ugh?
 use self::mio::tcp::{TcpListener, TcpStream};
-use self::bytes::{BytesMut, Bytes};
+use self::bytes::{BytesMut, Bytes, BufMut};
 
 struct FsmConn {
-    conn_ref: Ref,
+    conn_ref: ConnRef,
+    socket: TcpStream,
     read_buf: BytesMut,
+    req_read_count: usize,
     write_buf: BytesMut,
     fsm: Rc<RefCell<Box<FSM>>>,
+    // ref -> FsmConn
 }
 
 struct Acceptor {
@@ -28,8 +32,7 @@ pub struct TcpHandler {
 
     acceptors: HashMap<Token, RefCell<Acceptor>>,
 
-    refs: RefCell<HashMap<Token, Ref>>,
-    fsms: RefCell<HashMap<Token, FsmConn>>,
+    fsm_conns: RefCell<HashMap<Token, FsmConn>>,
 }
 
 impl TcpHandler {
@@ -38,9 +41,7 @@ impl TcpHandler {
             poll: Poll::new().unwrap(),
             next_token_index: RefCell::new(0),
             acceptors: HashMap::new(),
-
-            refs: RefCell::new(HashMap::new()),
-            fsms: RefCell::new(HashMap::new()),
+            fsm_conns: RefCell::new(HashMap::new()),
         }
     }
 
@@ -62,10 +63,8 @@ impl TcpHandler {
             for event in &events {
                 if let Some(acceptor) = self.acceptors.get(&event.token()) {
                     self.accept_connection(&acceptor.borrow());
-                } else { //if let Some(fsm) = self.fsms.get(&event.token()) {
-                    panic!("nyi");
-                    // TODO which Ref?
-
+                } else if let Some(fsm_conn) = self.fsm_conns.borrow_mut().get_mut(&event.token()) {
+                    self.handle_event(event.readiness(), fsm_conn);
                 }
             }
         }
@@ -80,47 +79,117 @@ impl TcpHandler {
 
         let fsm = Rc::new(RefCell::new((acceptor.spawn)()));
 
-        //self.refs.borrow_mut().insert(token, 0);
         let fsm_conn = FsmConn{
             conn_ref: 0,
+            socket: socket,
             read_buf: BytesMut::with_capacity(64 * 1024),
+            req_read_count: 0,
             write_buf: BytesMut::with_capacity(64 * 1024),
             fsm: fsm.clone(),
         };
-        self.fsms.borrow_mut().insert(token, fsm_conn);
+        self.fsm_conns.borrow_mut().insert(token, fsm_conn);
 
         let fsm = fsm.clone();
         let mut fsm = fsm.borrow_mut();
-        let ret = fsm.init();
-        self.handle_ret(ret).unwrap();
+        let mut ret = fsm.init();
+
+        // TODO bah ->
+        loop {
+            println!("loop");
+            let ev = self.handle_ret(ret);
+            match ev {
+                Event::None => break,
+                _ => ret = fsm.handle_event(ev),
+            }
+        }
     }
 
-    fn handle_ret(&self, ret: Return) -> Result<(), ()> {
-        Ok(())
+    fn handle_ret(&self, ret: Return) -> Event {
+        match ret {
+            Return::ReadExact(conn_ref, n) => {
+                // TODO set n!
+                Event::None
+                // if buf len is n, return call
+            }
+        }
+    }
+
+    fn handle_event(&self, ready: Ready, fsm_conn: &mut FsmConn) {
+        if ready.is_readable() {
+            let (_, terminate) = read_until_would_block(&mut fsm_conn.socket, &mut fsm_conn.read_buf).unwrap();
+            if fsm_conn.read_buf.len() >= fsm_conn.req_read_count {
+
+                let buf = fsm_conn.read_buf.split_to(fsm_conn.req_read_count);
+
+                println!("yey!: {:?} {:?}", buf, fsm_conn.read_buf);
+                let e = Event::Read(fsm_conn.conn_ref, buf.freeze());
+
+                let fsm = fsm_conn.fsm.clone();
+                let mut fsm = fsm.borrow_mut();
+                let ret = fsm.handle_event(e);
+
+                fsm_conn.req_read_count = 0;
+
+            }
+
+            if terminate {
+                panic!("NYI");
+            }
+        }
     }
 }
 
-type Ref = u64;
+type ConnRef = u64;
 
 #[derive(Debug)]
 pub enum Event {
-    Read(Ref, Bytes),
-    Terminate(Ref),
-    TerminateWithBuf(Ref, Bytes),
+    None,
+    Read(ConnRef, Bytes),
+    Terminate(ConnRef),
+    TerminateWithBuf(ConnRef, Bytes),
 }
 
 #[derive(Debug)]
 pub enum Return {
-    //Read(Ref),
-    ReadExact(Ref, usize),
-    //ReadAndWrite(Ref, Bytes),
-    //ReadExactAndWrite(Ref, usize, Bytes),
-    //Terminate(Ref),
-    //TerminateAndWrite(Ref, Bytes),
-    //Register(Ref, TcpStream),
+    //Read(ConnRef),
+    ReadExact(ConnRef, usize),
+    //ReadAndWrite(ConnRef, Bytes),
+    //ReadExactAndWrite(ConnRef, usize, Bytes),
+    //Terminate(ConnRef),
+    //TerminateAndWrite(ConnRef, Bytes),
+    //Register(ConnRef, TcpStream),
 }
 
 pub trait FSM {
     fn init(&mut self) -> Return;
     fn handle_event(&mut self, ev: Event) -> Return;
+}
+
+// ---
+
+fn read_until_would_block(src: &mut Read, buf: &mut BytesMut) -> Result<(usize, bool), Error> {
+    let mut total_size = 0;
+    let mut tmp_buf = [0; 64];
+
+    loop {
+        match src.read(&mut tmp_buf) {
+            Ok(0) => {
+                return Ok((total_size, true));
+            },
+            Ok(size) => {
+                buf.put(&tmp_buf[0 .. size]);
+                total_size += size;
+            },
+            Err(err) => {
+                if err.kind() == ErrorKind::WouldBlock {
+                    // socket is exhausted
+                    break;
+                } else {
+                    return Err(err);
+                }
+            }
+        }
+    }
+
+    return Ok((total_size, false));
 }
