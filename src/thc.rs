@@ -65,6 +65,7 @@ impl TcpHandler {
                 if let Some(acceptor) = self.acceptors.get(&event.token()) {
                     self.accept_connection(&acceptor.borrow());
                 } else if let Some(fsm_conn) = self.fsm_conns.borrow_mut().get_mut(&event.token()) {
+                    println!("before: {:?}", event.token());
                     self.handle_event(event.readiness(), fsm_conn);
                 }
             }
@@ -89,13 +90,16 @@ impl TcpHandler {
             fsm: fsm.clone(),
         };
         self.fsm_conns.borrow_mut().insert(token, fsm_conn);
+        fsm_conn.req_read_count = 42;
 
         let fsm = fsm.clone();
         let mut fsm = fsm.borrow_mut();
 
+
         // Currently we support only the ReadExact(0, <..>) return
         if let Return::ReadExact(0, count) = fsm.init() {
             fsm_conn.req_read_count = count;
+            println!("count!: {}, {:?}", count, token);
             self.poll.register(&*socket, token, Ready::readable(), PollOpt::edge() | PollOpt::oneshot()).unwrap();
         } else {
             panic!("NYI");
@@ -118,6 +122,7 @@ impl TcpHandler {
             let socket = Rc::get_mut(&mut fsm_conn.socket).unwrap();
             let (_, terminate) = read_until_would_block(socket, &mut fsm_conn.read_buf).unwrap();
             // TODO what if req_read_count == 0?
+            println!("what: {}", fsm_conn.req_read_count);
             if fsm_conn.read_buf.len() >= fsm_conn.req_read_count {
 
                 let buf = fsm_conn.read_buf.split_to(fsm_conn.req_read_count);
