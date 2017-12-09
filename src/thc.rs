@@ -6,7 +6,7 @@ use std::net::SocketAddr;
 use std::cell::RefCell;
 use std::rc::Rc;
 use std::collections::HashMap;
-use std::io::{Read, Error, ErrorKind};
+use std::io::{Read, Write, Error, ErrorKind};
 use self::mio::{Poll, Events, Token, PollOpt, Ready}; // TODO self, ugh?
 use self::mio::tcp::{TcpListener, TcpStream};
 use self::bytes::{BytesMut, Bytes, BufMut};
@@ -16,6 +16,7 @@ struct FsmConn {
     socket: Rc<TcpStream>,
     read_buf: BytesMut,
     req_read_count: usize,
+    read_registered: bool,
     write_buf: BytesMut,
     fsm: Rc<RefCell<Box<FSM>>>,
     // ref -> FsmConn
@@ -65,8 +66,7 @@ impl TcpHandler {
                 if let Some(acceptor) = self.acceptors.get(&event.token()) {
                     self.accept_connection(&acceptor.borrow());
                 } else if let Some(fsm_conn) = self.fsm_conns.borrow_mut().get_mut(&event.token()) {
-                    println!("before: {:?}", event.token());
-                    self.handle_event(event.readiness(), fsm_conn);
+                    self.handle_event(event.readiness(), event.token(), fsm_conn);
                 }
             }
         }
@@ -86,60 +86,96 @@ impl TcpHandler {
             socket: Rc::clone(&socket),
             read_buf: BytesMut::with_capacity(64 * 1024),
             req_read_count: 0,
+            read_registered: false,
             write_buf: BytesMut::with_capacity(64 * 1024),
             fsm: fsm.clone(),
         };
-        self.fsm_conns.borrow_mut().insert(token, fsm_conn);
-        fsm_conn.req_read_count = 42;
 
         let fsm = fsm.clone();
         let mut fsm = fsm.borrow_mut();
 
-
         // Currently we support only the ReadExact(0, <..>) return
         if let Return::ReadExact(0, count) = fsm.init() {
             fsm_conn.req_read_count = count;
-            println!("count!: {}, {:?}", count, token);
-            self.poll.register(&*socket, token, Ready::readable(), PollOpt::edge() | PollOpt::oneshot()).unwrap();
+            fsm_conn.read_registered = true;
         } else {
             panic!("NYI");
         }
+
+        self.fsm_conns.borrow_mut().insert(token, fsm_conn);
+        // Because we support only ReadExact, we can register it here.
+        // Order is important, as we do not want to get evented while FSM conn
+        // is not stored in the hashmap ^^.
+        self.poll.register(&*socket, token, Ready::readable(), PollOpt::edge() | PollOpt::oneshot()).unwrap();
     }
 
-    fn handle_ret(&self, ret: Return) {
+    fn handle_ret(&self, ret: Return, token: Token, fsm_conn: &mut FsmConn) {
         match ret {
             Return::ReadExact(conn_ref, count) => {
-                //self.poll.
-                // <--------->
-
-                // if buf len is n, return call
+                assert_eq!(conn_ref, fsm_conn.conn_ref);
+                fsm_conn.req_read_count = count;
+                if !fsm_conn.read_registered {
+                    self.poll.reregister(&*fsm_conn.socket, token, Ready::readable(), PollOpt::edge() | PollOpt::oneshot()).unwrap();
+                    fsm_conn.read_registered = true;
+                }
             }
         }
     }
 
-    fn handle_event(&self, ready: Ready, fsm_conn: &mut FsmConn) {
-        if ready.is_readable() {
-            let socket = Rc::get_mut(&mut fsm_conn.socket).unwrap();
-            let (_, terminate) = read_until_would_block(socket, &mut fsm_conn.read_buf).unwrap();
-            // TODO what if req_read_count == 0?
-            println!("what: {}", fsm_conn.req_read_count);
-            if fsm_conn.read_buf.len() >= fsm_conn.req_read_count {
+    fn handle_event(&self, ready: Ready, token: Token, fsm_conn: &mut FsmConn) {
+        let mut ready = ready;
 
+        let mut ok = true;
+        while ok {
+            ok = false;
+            if ready.is_empty() && fsm_conn.req_read_count != 0 && fsm_conn.read_buf.len() >= fsm_conn.req_read_count {
                 let buf = fsm_conn.read_buf.split_to(fsm_conn.req_read_count);
 
-                println!("yey!: {:?} {:?}", buf, fsm_conn.read_buf);
                 let e = Event::Read(fsm_conn.conn_ref, buf.freeze());
 
                 let fsm = fsm_conn.fsm.clone();
                 let mut fsm = fsm.borrow_mut();
-                let ret = fsm.handle_event(e);
-
                 fsm_conn.req_read_count = 0;
+                let ret = fsm.handle_event(e);
+                self.handle_ret(ret, token, fsm_conn);
+                ok = true;
+            } else {
+                if ready.is_readable() {
 
-            }
+                    ok = true;
+                    {
+                        let socket = Rc::get_mut(&mut fsm_conn.socket).unwrap();
+                        let (_, terminate) = read_until_would_block(socket, &mut fsm_conn.read_buf).unwrap();
+                    }
+                    // TODO skip when req_read_count == 0?
+                    if fsm_conn.read_buf.len() >= fsm_conn.req_read_count {
+                        let buf = fsm_conn.read_buf.split_to(fsm_conn.req_read_count);
 
-            if terminate {
-                panic!("NYI");
+                        let e = Event::Read(fsm_conn.conn_ref, buf.freeze());
+
+                        let fsm = fsm_conn.fsm.clone();
+                        let mut fsm = fsm.borrow_mut();
+                        fsm_conn.req_read_count = 0;
+                        // TODO -->
+                        let ret = fsm.handle_event(e);
+                        self.handle_ret(ret, token, fsm_conn);
+                    }
+
+                    ready = ready ^ Ready::readable();
+                    fsm_conn.read_registered = false;
+
+                    //if terminate {
+                    //    panic!("NYI");
+                    //}
+                }
+                if ready.is_writable() && fsm_conn.write_buf.len() != 0 {
+                    ok = true;
+                    let socket = Rc::get_mut(&mut fsm_conn.socket).unwrap();
+                    write_and_flush(socket, &mut fsm_conn.write_buf);
+                    fsm_conn.write_buf.clear();
+
+                    ready = ready ^ Ready::writable();
+                }
             }
         }
     }
@@ -198,4 +234,10 @@ fn read_until_would_block(src: &mut Read, buf: &mut BytesMut) -> Result<(usize, 
     }
 
     return Ok((total_size, false));
+}
+
+fn write_and_flush(dst: &mut Write, buf: &[u8]) {
+    let size = dst.write(&buf).unwrap();
+    assert_eq!(size, buf.len());
+    dst.flush().unwrap();
 }
