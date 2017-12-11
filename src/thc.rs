@@ -114,7 +114,7 @@ impl TcpHandler {
             Return::ReadExact(conn_ref, count) => {
                 assert_eq!(conn_ref, fsm_conn.conn_ref);
                 fsm_conn.req_read_count = count;
-                if !fsm_conn.read_registered {
+                if !fsm_conn.read_registered { // TODO: never, registered, none
                     self.poll.reregister(&*fsm_conn.socket, token, Ready::readable(), PollOpt::edge() | PollOpt::oneshot()).unwrap();
                     fsm_conn.read_registered = true;
                 }
@@ -195,10 +195,10 @@ pub enum Event {
 pub enum Return {
     //Read(ConnRef),
     ReadExact(ConnRef, usize),
-    //ReadAndWrite(ConnRef, Bytes),
-    //ReadExactAndWrite(ConnRef, usize, Bytes),
+    //WriteAndRead(ConnRef, Bytes),
+    //WriteAndReadExact(ConnRef, usize, Bytes),
     //Terminate(ConnRef),
-    //TerminateAndWrite(ConnRef, Bytes),
+    //WriteAndTerminate(ConnRef, Bytes),
     //Register(ConnRef, TcpStream),
 }
 
