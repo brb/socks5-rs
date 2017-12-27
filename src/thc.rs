@@ -32,9 +32,7 @@ pub struct TcpHandler {
     poll: Poll,
     //events: Events,
     next_token_index: RefCell<usize>, // for mio poll
-
     acceptors: HashMap<Token, RefCell<Acceptor>>,
-
     fsm_conns: RefCell<HashMap<Token, FsmConn>>,
 }
 
@@ -178,16 +176,16 @@ pub enum Event {
     None,
     Read(ConnRef, Bytes),
     Terminate(ConnRef),
-    TerminateWithBuf(ConnRef, Bytes),
+    TerminateAfterRead(ConnRef, Bytes),
 }
 
 #[derive(Debug)]
 // TODO maybe support multiple Returns (and hence, s/Return/Action)
+// TODO change from Bytes to b[..]
 pub enum Return {
     //Read(ConnRef),
     ReadExact(ConnRef, usize),
     //WriteAndRead(ConnRef, Bytes),
-    // TODO change from Bytes to b[..]
     WriteAndReadExact(ConnRef, Bytes, ConnRef, usize),
     //Terminate(ConnRef),
     //WriteAndTerminate(ConnRef, Bytes),
@@ -199,7 +197,7 @@ pub trait FSM {
     fn handle_event(&mut self, ev: Event) -> Return;
 }
 
-// ---
+// --- Helpers
 
 fn read_until_would_block(src: &mut Read, buf: &mut BytesMut) -> Result<(usize, bool), Error> {
     let mut total_size = 0;

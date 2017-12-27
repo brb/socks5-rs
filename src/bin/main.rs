@@ -5,6 +5,9 @@ extern crate bytes;
 use socks5_rs::thc;
 use socks5_rs::thc::{FSM, Event, Return};
 use self::bytes::Bytes;
+use bytes::{ByteOrder, BigEndian};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, Shutdown};
+use mio::tcp::TcpStream;
 
 const LADDR: &'static str = "127.0.0.1:1080";
 
@@ -40,6 +43,7 @@ impl FSM for Socks5 {
             State::ReceiveVsnAndAuthCount => self.inner.receive_vsm_and_auth_count(ev),
             State::ReceiveAuthMethods => self.inner.receive_auth_methods(ev),
             State::ReceiveAddrType => self.inner.receive_addr_type(ev),
+            State::ReceiveAddr => self.inner.receive_addr(ev),
         }
     }
 }
@@ -51,6 +55,7 @@ enum State {
     ReceiveVsnAndAuthCount,
     ReceiveAuthMethods,
     ReceiveAddrType,
+    ReceiveAddr,
 }
 
 impl Socks5Inner {
@@ -65,9 +70,9 @@ impl Socks5Inner {
     }
 
     fn receive_auth_methods(&mut self, ev: Event) -> Return {
-        if let Event::Read(0, ref bytes) = ev {
-            // we only support noauth(=0x0)
-            let noauth_found = bytes.iter().find(|&b| *b == 0x0);
+        if let Event::Read(0, ref buf) = ev {
+            // We only support noauth(=0x0)
+            let noauth_found = buf.iter().find(|&b| *b == 0x0);
             if noauth_found == None {
                 panic!("noauth not found");
             }
@@ -80,6 +85,41 @@ impl Socks5Inner {
     }
 
     fn receive_addr_type(&mut self, ev: Event) -> Return {
-        panic!("yey");
+        if let Event::Read(0, ref buf) = ev {
+            assert_eq!(5, buf[0]); // SOCKS5 vsn
+            assert_eq!(1, buf[1]); // CMD CONNECT
+            // We only support IPv4
+            assert_eq!(1, buf[3]); // ATYP IPv4
+            self.next_state = State::ReceiveAddr;
+            Return::ReadExact(0, 6)
+        } else {
+            panic!("invalid");
+        }
+    }
+
+    fn receive_addr(&mut self, ev: Event) -> Return {
+        if let Event::Read(0, ref buf) = ev {
+            let addr = IpAddr::V4(Ipv4Addr::new(buf[0], buf[1], buf[2], buf[3]));
+            let port: u16 = BigEndian::read_u16(&[buf[4], buf[5]][..]);
+            let target = TcpStream::connect(&SocketAddr::new(addr, port)).unwrap();
+
+            let addr = target.local_addr().unwrap();
+            let reply;
+            if let IpAddr::V4(ip) = addr.ip() {
+                let port = addr.port();
+                let ip = ip.octets();
+                reply = [
+                    5, 0, 0, 1,
+                    ip[0], ip[1], ip[2], ip[3],
+                    (port >> 8) as u8, port as u8
+                ];
+            } else {
+                panic!("invalid");
+            }
+
+            panic!("target: {:?} port: {}", target, port);
+        } else {
+            panic!("invalid");
+        }
     }
 }
