@@ -146,17 +146,12 @@ impl TcpHandler {
             match r {
                 Return::ReadExact(conn_ref, count) => {
                     assert_eq!(conn_ref, fsm_conn.conn_ref);
-
                     fsm_conn.req_read_count = count;
                     fsm_conn.read = true;
                 },
-                Return::WriteAndReadExact(write_conn_ref, msg, read_conn_ref, count) => {
+                Return::Write(write_conn_ref, reply) => {
                     assert_eq!(write_conn_ref, fsm_conn.conn_ref);
-                    assert_eq!(read_conn_ref, fsm_conn.conn_ref);
-
-                    fsm_conn.req_read_count = count;
-                    fsm_conn.read = true;
-                    fsm_conn.write_buf.put(msg);
+                    fsm_conn.write_buf.put(reply);
                     fsm_conn.write = true;
                 },
             }
@@ -187,8 +182,7 @@ pub enum Event {
 pub enum Return {
     //Read(ConnRef),
     ReadExact(ConnRef, usize),
-    //WriteAndRead(ConnRef, Bytes),
-    WriteAndReadExact(ConnRef, Bytes, ConnRef, usize),
+    Write(ConnRef, Bytes),
     //Terminate(ConnRef),
     //WriteAndTerminate(ConnRef, Bytes),
     //Register(ConnRef, TcpStream),

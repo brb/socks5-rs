@@ -77,7 +77,7 @@ impl Socks5Inner {
             }
             self.next_state = State::ReceiveAddrType;
             let ret: &[u8] = &[5, 0];
-            return vec![Return::WriteAndReadExact(0, Bytes::from(ret), 0, 4)];
+            return vec![Return::Write(0, Bytes::from(ret)), Return::ReadExact(0, 4)];
         }
         panic!("invalid");
     }
@@ -113,7 +113,7 @@ impl Socks5Inner {
                 //      2. Return vectorization
                 //      3. conn_ref registration
                 self.next_state = State::Init;
-                return vec![Return::WriteAndReadExact(0, Bytes::from(reply), 0, 4)];
+                return vec![Return::Write(0, Bytes::from(reply)), Return::ReadExact(0, 4)];
             }
         }
         panic!("invalid");
