@@ -141,23 +141,25 @@ impl TcpHandler {
         self.poll_reregister(fsm_conn.read, fsm_conn.write, &*fsm_conn.socket, token);
     }
 
-    fn handle_fsm_return(&self, ret: Return, token: Token, fsm_conn: &mut FsmConn) {
-        match ret {
-            Return::ReadExact(conn_ref, count) => {
-                assert_eq!(conn_ref, fsm_conn.conn_ref);
+    fn handle_fsm_return(&self, ret: Vec<Return>, token: Token, fsm_conn: &mut FsmConn) {
+        for r in ret {
+            match r {
+                Return::ReadExact(conn_ref, count) => {
+                    assert_eq!(conn_ref, fsm_conn.conn_ref);
 
-                fsm_conn.req_read_count = count;
-                fsm_conn.read = true;
-            },
-            Return::WriteAndReadExact(write_conn_ref, msg, read_conn_ref, count) => {
-                assert_eq!(write_conn_ref, fsm_conn.conn_ref);
-                assert_eq!(read_conn_ref, fsm_conn.conn_ref);
+                    fsm_conn.req_read_count = count;
+                    fsm_conn.read = true;
+                },
+                Return::WriteAndReadExact(write_conn_ref, msg, read_conn_ref, count) => {
+                    assert_eq!(write_conn_ref, fsm_conn.conn_ref);
+                    assert_eq!(read_conn_ref, fsm_conn.conn_ref);
 
-                fsm_conn.req_read_count = count;
-                fsm_conn.read = true;
-                fsm_conn.write_buf.put(msg);
-                fsm_conn.write = true;
-            },
+                    fsm_conn.req_read_count = count;
+                    fsm_conn.read = true;
+                    fsm_conn.write_buf.put(msg);
+                    fsm_conn.write = true;
+                },
+            }
         }
     }
 
@@ -193,8 +195,8 @@ pub enum Return {
 }
 
 pub trait FSM {
-    fn init(&mut self) -> Return;
-    fn handle_event(&mut self, ev: Event) -> Return;
+    fn init(&mut self) -> Return; // TODO maybe vectorize as well?
+    fn handle_event(&mut self, ev: Event) -> Vec<Return>;
 }
 
 // --- Helpers
