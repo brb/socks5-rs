@@ -1,8 +1,10 @@
 extern crate mio;
 extern crate socks5_rs;
+extern crate bytes;
 
 use socks5_rs::thc;
 use socks5_rs::thc::{FSM, Event, Return};
+use self::bytes::Bytes;
 
 const LADDR: &'static str = "127.0.0.1:1080";
 
@@ -43,6 +45,7 @@ impl FSM for Socks5 {
 
 //#[derive(PartialEq, Debug)]
 enum State {
+    // TODO macro?
     Init,
     ReceiveVsnAndAuthCount,
     ReceiveAuthMethods,
@@ -66,7 +69,9 @@ impl Socks5Inner {
             if noauth_found == None {
                 panic!("noauth not found");
             }
-            Return::WriteAndReadExact(0, 4)
+            let ret: &[u8] = &[5, 0];
+            self.next_state = State::Init; // TODO
+            Return::WriteAndReadExact(0, Bytes::from(ret), 0, 4)
         } else {
             panic!("invalid");
         }

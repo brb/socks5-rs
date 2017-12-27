@@ -16,8 +16,9 @@ struct FsmConn {
     socket: Rc<TcpStream>,
     read_buf: BytesMut,
     req_read_count: usize,
-    read_registered: bool,
+    read: bool,
     write_buf: BytesMut,
+    write: bool,
     fsm: Rc<RefCell<Box<FSM>>>,
     // ref -> FsmConn
 }
@@ -66,7 +67,7 @@ impl TcpHandler {
                 if let Some(acceptor) = self.acceptors.get(&event.token()) {
                     self.accept_connection(&acceptor.borrow());
                 } else if let Some(fsm_conn) = self.fsm_conns.borrow_mut().get_mut(&event.token()) {
-                    self.handle_event(event.readiness(), event.token(), fsm_conn);
+                    self.handle_poll_event(event.readiness(), event.token(), fsm_conn);
                 }
             }
         }
@@ -86,8 +87,9 @@ impl TcpHandler {
             socket: Rc::clone(&socket),
             read_buf: BytesMut::with_capacity(64 * 1024),
             req_read_count: 0,
-            read_registered: false,
+            read: false,
             write_buf: BytesMut::with_capacity(64 * 1024),
+            write: false,
             fsm: fsm.clone(),
         };
 
@@ -97,7 +99,7 @@ impl TcpHandler {
         // Currently we support only the ReadExact(0, <..>) return
         if let Return::ReadExact(0, count) = fsm.init() {
             fsm_conn.req_read_count = count;
-            fsm_conn.read_registered = true;
+            fsm_conn.read = true;
         } else {
             panic!("NYI");
         }
@@ -109,20 +111,8 @@ impl TcpHandler {
         self.poll.register(&*socket, token, Ready::readable(), PollOpt::edge() | PollOpt::oneshot()).unwrap();
     }
 
-    fn handle_ret(&self, ret: Return, token: Token, fsm_conn: &mut FsmConn) {
-        match ret {
-            Return::ReadExact(conn_ref, count) => {
-                assert_eq!(conn_ref, fsm_conn.conn_ref);
-                fsm_conn.req_read_count = count;
-                if !fsm_conn.read_registered { // TODO: never, registered, none
-                    self.poll.reregister(&*fsm_conn.socket, token, Ready::readable(), PollOpt::edge() | PollOpt::oneshot()).unwrap();
-                    fsm_conn.read_registered = true;
-                }
-            }
-        }
-    }
-
-    fn handle_event(&self, ready: Ready, token: Token, fsm_conn: &mut FsmConn) {
+    fn handle_poll_event(&self, ready: Ready, token: Token, fsm_conn: &mut FsmConn) {
+        println!("handle_poll_event: {:?}", ready);
         let mut ready = ready;
 
         let mut ok = true;
@@ -137,11 +127,10 @@ impl TcpHandler {
                 let mut fsm = fsm.borrow_mut();
                 fsm_conn.req_read_count = 0;
                 let ret = fsm.handle_event(e);
-                self.handle_ret(ret, token, fsm_conn);
+                self.handle_fsm_return(ret, token, fsm_conn);
                 ok = true;
             } else {
                 if ready.is_readable() {
-
                     ok = true;
                     {
                         let socket = Rc::get_mut(&mut fsm_conn.socket).unwrap();
@@ -158,26 +147,56 @@ impl TcpHandler {
                         fsm_conn.req_read_count = 0;
                         // TODO -->
                         let ret = fsm.handle_event(e);
-                        self.handle_ret(ret, token, fsm_conn);
+                        self.handle_fsm_return(ret, token, fsm_conn);
                     }
 
                     ready = ready ^ Ready::readable();
-                    fsm_conn.read_registered = false;
-
-                    //if terminate {
-                    //    panic!("NYI");
-                    //}
+                    fsm_conn.read = false;
                 }
                 if ready.is_writable() && fsm_conn.write_buf.len() != 0 {
                     ok = true;
                     let socket = Rc::get_mut(&mut fsm_conn.socket).unwrap();
                     write_and_flush(socket, &mut fsm_conn.write_buf);
                     fsm_conn.write_buf.clear();
+                    fsm_conn.write = false;
 
                     ready = ready ^ Ready::writable();
                 }
             }
         }
+
+        self.reregister_poll(fsm_conn.read, fsm_conn.write, &*fsm_conn.socket, token);
+    }
+
+    fn handle_fsm_return(&self, ret: Return, token: Token, fsm_conn: &mut FsmConn) {
+        match ret {
+            Return::ReadExact(conn_ref, count) => {
+                assert_eq!(conn_ref, fsm_conn.conn_ref);
+
+                fsm_conn.req_read_count = count;
+                fsm_conn.read = true;
+            },
+            Return::WriteAndReadExact(write_conn_ref, msg, read_conn_ref, count) => {
+                assert_eq!(write_conn_ref, fsm_conn.conn_ref);
+                assert_eq!(read_conn_ref, fsm_conn.conn_ref);
+
+                fsm_conn.req_read_count = count;
+                fsm_conn.read = true;
+                fsm_conn.write_buf.put(msg);
+                fsm_conn.write = true;
+            },
+        }
+    }
+
+    fn reregister_poll(&self, read: bool, write: bool, socket: &TcpStream, token: Token) {
+        let mut ready = Ready::empty();
+        if read {
+            ready = ready | Ready::readable();
+        }
+        if write {
+            ready = ready | Ready::writable();
+        }
+        self.poll.reregister(socket, token, ready, PollOpt::edge() | PollOpt::oneshot()).unwrap();
     }
 }
 
@@ -192,11 +211,13 @@ pub enum Event {
 }
 
 #[derive(Debug)]
+// TODO maybe support multiple Returns (and hence, s/Return/Action)
 pub enum Return {
     //Read(ConnRef),
     ReadExact(ConnRef, usize),
     //WriteAndRead(ConnRef, Bytes),
-    //WriteAndReadExact(ConnRef, usize, Bytes),
+    // TODO change from Bytes to b[..]
+    WriteAndReadExact(ConnRef, Bytes, ConnRef, usize),
     //Terminate(ConnRef),
     //WriteAndTerminate(ConnRef, Bytes),
     //Register(ConnRef, TcpStream),
