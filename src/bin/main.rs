@@ -39,6 +39,7 @@ impl FSM for Socks5 {
             State::Init => panic!("invalid"),
             State::ReceiveVsnAndAuthCount => self.inner.receive_vsm_and_auth_count(ev),
             State::ReceiveAuthMethods => self.inner.receive_auth_methods(ev),
+            State::ReceiveAddrType => self.inner.receive_addr_type(ev),
         }
     }
 }
@@ -49,19 +50,20 @@ enum State {
     Init,
     ReceiveVsnAndAuthCount,
     ReceiveAuthMethods,
+    ReceiveAddrType,
 }
 
 impl Socks5Inner {
     fn receive_vsm_and_auth_count(&mut self, ev: Event) -> Return {
         if let Event::Read(0, bytes) = ev {
-            assert_eq!(5, bytes[0]); // socks5 vsn
+            assert_eq!(5, bytes[0]); // SOCKS5 vsn
             self.next_state = State::ReceiveAuthMethods;
-            println!("receive_vsm_and_auth_count: {}", bytes[1]);
             Return::ReadExact(0, bytes[1] as usize)
         } else {
             panic!("invalid");
         }
     }
+
     fn receive_auth_methods(&mut self, ev: Event) -> Return {
         if let Event::Read(0, ref bytes) = ev {
             // we only support noauth(=0x0)
@@ -69,11 +71,15 @@ impl Socks5Inner {
             if noauth_found == None {
                 panic!("noauth not found");
             }
+            self.next_state = State::ReceiveAddrType;
             let ret: &[u8] = &[5, 0];
-            self.next_state = State::Init; // TODO
             Return::WriteAndReadExact(0, Bytes::from(ret), 0, 4)
         } else {
             panic!("invalid");
         }
+    }
+
+    fn receive_addr_type(&mut self, ev: Event) -> Return {
+        panic!("yey");
     }
 }

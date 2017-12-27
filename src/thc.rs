@@ -67,7 +67,7 @@ impl TcpHandler {
                 if let Some(acceptor) = self.acceptors.get(&event.token()) {
                     self.accept_connection(&acceptor.borrow());
                 } else if let Some(fsm_conn) = self.fsm_conns.borrow_mut().get_mut(&event.token()) {
-                    self.handle_poll_event(event.readiness(), event.token(), fsm_conn);
+                    self.handle_poll_events(event.readiness(), event.token(), fsm_conn);
                 }
             }
         }
@@ -111,61 +111,36 @@ impl TcpHandler {
         self.poll.register(&*socket, token, Ready::readable(), PollOpt::edge() | PollOpt::oneshot()).unwrap();
     }
 
-    fn handle_poll_event(&self, ready: Ready, token: Token, fsm_conn: &mut FsmConn) {
-        println!("handle_poll_event: {:?}", ready);
-        let mut ready = ready;
+    fn handle_poll_events(&self, ready: Ready, token: Token, fsm_conn: &mut FsmConn) {
+        println!("handle_poll_events: {:?}", ready);
 
-        let mut ok = true;
-        while ok {
-            ok = false;
-            if ready.is_empty() && fsm_conn.req_read_count != 0 && fsm_conn.read_buf.len() >= fsm_conn.req_read_count {
+        // Read from socket
+        if ready.is_readable() {
+            let socket = Rc::get_mut(&mut fsm_conn.socket).unwrap();
+            let (_, terminate) = read_until_would_block(socket, &mut fsm_conn.read_buf).unwrap();
+            assert!(!terminate); // TODO NYI
+            fsm_conn.read = false;
+        }
+
+        // Write to socket
+        if ready.is_writable() && fsm_conn.write_buf.len() != 0 {
+            let socket = Rc::get_mut(&mut fsm_conn.socket).unwrap();
+            write_and_flush(socket, &mut fsm_conn.write_buf);
+            fsm_conn.write_buf.clear();
+            fsm_conn.write = false;
+        }
+
+        while fsm_conn.req_read_count != 0 && fsm_conn.read_buf.len() >= fsm_conn.req_read_count {
                 let buf = fsm_conn.read_buf.split_to(fsm_conn.req_read_count);
-
                 let e = Event::Read(fsm_conn.conn_ref, buf.freeze());
-
                 let fsm = fsm_conn.fsm.clone();
                 let mut fsm = fsm.borrow_mut();
                 fsm_conn.req_read_count = 0;
                 let ret = fsm.handle_event(e);
                 self.handle_fsm_return(ret, token, fsm_conn);
-                ok = true;
-            } else {
-                if ready.is_readable() {
-                    ok = true;
-                    {
-                        let socket = Rc::get_mut(&mut fsm_conn.socket).unwrap();
-                        let (_, terminate) = read_until_would_block(socket, &mut fsm_conn.read_buf).unwrap();
-                    }
-                    // TODO skip when req_read_count == 0?
-                    if fsm_conn.read_buf.len() >= fsm_conn.req_read_count {
-                        let buf = fsm_conn.read_buf.split_to(fsm_conn.req_read_count);
-
-                        let e = Event::Read(fsm_conn.conn_ref, buf.freeze());
-
-                        let fsm = fsm_conn.fsm.clone();
-                        let mut fsm = fsm.borrow_mut();
-                        fsm_conn.req_read_count = 0;
-                        // TODO -->
-                        let ret = fsm.handle_event(e);
-                        self.handle_fsm_return(ret, token, fsm_conn);
-                    }
-
-                    ready = ready ^ Ready::readable();
-                    fsm_conn.read = false;
-                }
-                if ready.is_writable() && fsm_conn.write_buf.len() != 0 {
-                    ok = true;
-                    let socket = Rc::get_mut(&mut fsm_conn.socket).unwrap();
-                    write_and_flush(socket, &mut fsm_conn.write_buf);
-                    fsm_conn.write_buf.clear();
-                    fsm_conn.write = false;
-
-                    ready = ready ^ Ready::writable();
-                }
-            }
         }
 
-        self.reregister_poll(fsm_conn.read, fsm_conn.write, &*fsm_conn.socket, token);
+        self.poll_reregister(fsm_conn.read, fsm_conn.write, &*fsm_conn.socket, token);
     }
 
     fn handle_fsm_return(&self, ret: Return, token: Token, fsm_conn: &mut FsmConn) {
@@ -188,14 +163,10 @@ impl TcpHandler {
         }
     }
 
-    fn reregister_poll(&self, read: bool, write: bool, socket: &TcpStream, token: Token) {
+    fn poll_reregister(&self, read: bool, write: bool, socket: &TcpStream, token: Token) {
         let mut ready = Ready::empty();
-        if read {
-            ready = ready | Ready::readable();
-        }
-        if write {
-            ready = ready | Ready::writable();
-        }
+        if read { ready = ready | Ready::readable(); }
+        if write { ready = ready | Ready::writable(); }
         self.poll.reregister(socket, token, ready, PollOpt::edge() | PollOpt::oneshot()).unwrap();
     }
 }
