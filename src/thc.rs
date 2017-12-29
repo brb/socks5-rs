@@ -11,16 +11,18 @@ use self::mio::{Poll, Events, Token, PollOpt, Ready}; // TODO self, ugh?
 use self::mio::tcp::{TcpListener, TcpStream};
 use self::bytes::{BytesMut, Bytes, BufMut};
 
+struct FsmState {
+    fsm_conns: HashMap<ConnRef, FsmConn>,
+    fsm: Rc<RefCell<Box<FSM>>>,
+}
+
 struct FsmConn {
-    conn_ref: ConnRef,
     socket: Rc<TcpStream>,
     read_buf: BytesMut,
     req_read_count: usize,
-    read: bool,
+    read: bool, // TODO -1 to indicate ReadNonExact
     write_buf: BytesMut,
     write: bool,
-    fsm: Rc<RefCell<Box<FSM>>>,
-    // ref -> FsmConn
 }
 
 struct Acceptor {
@@ -28,12 +30,26 @@ struct Acceptor {
     spawn: fn() -> Box<FSM>,
 }
 
+struct FsmConnId {
+    main_token: Token, // acceptor token; used to identify FsmState
+    conn_ref: ConnRef,
+}
+
 pub struct TcpHandler {
     poll: Poll,
-    //events: Events,
     next_token_index: RefCell<usize>, // for mio poll
     acceptors: HashMap<Token, RefCell<Acceptor>>,
-    fsm_conns: RefCell<HashMap<Token, FsmConn>>,
+
+    fsm_conn_ids: RefCell<HashMap<Token, FsmConnId>>,
+    fsm_states: RefCell<HashMap<Token, FsmState>>,
+
+    // poll event:
+    // 1. fsm_conn_ids[token] -> (main_token, conn_ref) // <-- register (token+1, hashmap)
+    // 2. fsms[main_token] -> fsm
+    // 3. fsm.conns[conn_ref] -> (socket, write_buf, read_buf)
+    //
+    // fsm return:
+    // 1. fsm[conn_ref] -> socket
 }
 
 impl TcpHandler {
@@ -42,7 +58,8 @@ impl TcpHandler {
             poll: Poll::new().unwrap(),
             next_token_index: RefCell::new(0),
             acceptors: HashMap::new(),
-            fsm_conns: RefCell::new(HashMap::new()),
+            fsm_conn_ids: RefCell::new(HashMap::new()),
+            fsm_states: RefCell::new(HashMap::new()),
         }
     }
 
@@ -64,9 +81,18 @@ impl TcpHandler {
             for event in &events {
                 if let Some(acceptor) = self.acceptors.get(&event.token()) {
                     self.accept_connection(&acceptor.borrow());
-                } else if let Some(fsm_conn) = self.fsm_conns.borrow_mut().get_mut(&event.token()) {
-                    self.handle_poll_events(event.readiness(), event.token(), fsm_conn);
+                // Otherwise, we need to get FsmConn.
+                } else if let Some(fsm_conn_id) = self.fsm_conn_ids.borrow().get(&event.token()) {
+                    if let Some(ref mut fsm_state) = self.fsm_states.borrow_mut().get_mut(&fsm_conn_id.main_token) {
+                        self.handle_poll_events(event.readiness(), event.token(), fsm_conn_id, fsm_state);
+                        //if let Some(ref fsm_conn) = fsm_state.fsm_conns.get_mut(&fsm_conn_id.conn_ref) {
+                        //    // TODO maybe pass fsm_state instead of fsm_conn?
+                        //    self.handle_poll_events(event.readiness(), event.token(), fsm_conn);
+                        //}
+                    }
                 }
+                //else if let Some(fsm_conn) = self.fsm_conns.borrow_mut().get_mut(&event.token()) {
+                //}
             }
         }
     }
@@ -81,13 +107,16 @@ impl TcpHandler {
         let socket = Rc::new(socket);
 
         let mut fsm_conn = FsmConn{
-            conn_ref: 0, // indicates the main connection
             socket: Rc::clone(&socket),
             read_buf: BytesMut::with_capacity(64 * 1024),
             req_read_count: 0,
             read: false,
             write_buf: BytesMut::with_capacity(64 * 1024),
             write: false,
+        };
+
+        let mut fsm_state = FsmState{
+            fsm_conns: HashMap::new(),
             fsm: fsm.clone(),
         };
 
@@ -102,15 +131,26 @@ impl TcpHandler {
             panic!("NYI");
         }
 
-        self.fsm_conns.borrow_mut().insert(token, fsm_conn);
+        fsm_state.fsm_conns.insert(0, fsm_conn);
+
+        self.fsm_states.borrow_mut().insert(token, fsm_state);
+        self.fsm_conn_ids.borrow_mut().insert(token, FsmConnId{main_token: token, conn_ref: 0});
+
         // Because we support only ReadExact, we can register it here.
         // Order is important, as we do not want to get evented while FSM conn
         // is not stored in the hashmap ^^.
         self.poll.register(&*socket, token, Ready::readable(), PollOpt::edge() | PollOpt::oneshot()).unwrap();
     }
 
-    fn handle_poll_events(&self, ready: Ready, token: Token, fsm_conn: &mut FsmConn) {
+    fn handle_poll_events(&self, ready: Ready, token: Token, fsm_conn_id: &FsmConnId, fsm_state: &mut FsmState) {
         println!("handle_poll_events: {:?}", ready);
+
+        let mut fsm_conn;
+        if let Some(f) = fsm_state.fsm_conns.get_mut(&fsm_conn_id.conn_ref) {
+            fsm_conn = f;
+        } else {
+            panic!("not found");
+        }
 
         // Read from socket
         if ready.is_readable() {
@@ -130,11 +170,12 @@ impl TcpHandler {
 
         while fsm_conn.req_read_count != 0 && fsm_conn.read_buf.len() >= fsm_conn.req_read_count {
                 let buf = fsm_conn.read_buf.split_to(fsm_conn.req_read_count);
-                let e = Event::Read(fsm_conn.conn_ref, buf.freeze());
-                let fsm = fsm_conn.fsm.clone();
+                let e = Event::Read(fsm_conn_id.conn_ref, buf.freeze());
+                let fsm = fsm_state.fsm.clone();
                 let mut fsm = fsm.borrow_mut();
                 fsm_conn.req_read_count = 0;
                 let ret = fsm.handle_event(e);
+                // TODO return vec![conn_ref] to indicate which sockets should be reregistered
                 self.handle_fsm_return(ret, token, fsm_conn);
         }
 
@@ -145,14 +186,19 @@ impl TcpHandler {
         for r in ret {
             match r {
                 Return::ReadExact(conn_ref, count) => {
-                    assert_eq!(conn_ref, fsm_conn.conn_ref);
+                    //assert_eq!(conn_ref, fsm_conn.conn_ref);
                     fsm_conn.req_read_count = count;
                     fsm_conn.read = true;
                 },
                 Return::Write(write_conn_ref, reply) => {
-                    assert_eq!(write_conn_ref, fsm_conn.conn_ref);
+                    //assert_eq!(write_conn_ref, fsm_conn.conn_ref);
                     fsm_conn.write_buf.put(reply);
                     fsm_conn.write = true;
+                },
+                Return::Register(conn_ref, socket) => {
+                    // 1. Get token
+                    // 2. Insert into self.conn_maps
+                    panic!("start here");
                 },
             }
         }
@@ -180,12 +226,12 @@ pub enum Event {
 // TODO maybe support multiple Returns (and hence, s/Return/Action)
 // TODO change from Bytes to b[..]
 pub enum Return {
-    //Read(ConnRef),
     ReadExact(ConnRef, usize),
     Write(ConnRef, Bytes),
+    Register(ConnRef, TcpStream),
     //Terminate(ConnRef),
+    //Read(ConnRef),
     //WriteAndTerminate(ConnRef, Bytes),
-    //Register(ConnRef, TcpStream),
 }
 
 pub trait FSM {

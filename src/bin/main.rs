@@ -96,6 +96,7 @@ impl Socks5Inner {
 
     fn receive_addr(&mut self, ev: Event) -> Vec<Return> {
         if let Event::Read(0, ref buf) = ev {
+
             let addr = IpAddr::V4(Ipv4Addr::new(buf[0], buf[1], buf[2], buf[3]));
             let port: u16 = BigEndian::read_u16(&[buf[4], buf[5]][..]);
             let target = TcpStream::connect(&SocketAddr::new(addr, port)).unwrap();
@@ -109,11 +110,12 @@ impl Socks5Inner {
                     ip[0], ip[1], ip[2], ip[3],
                     (port >> 8) as u8, port as u8
                 ];
-                // TODO 1. change reply type
-                //      2. Return vectorization
-                //      3. conn_ref registration
                 self.next_state = State::Init;
-                return vec![Return::Write(0, Bytes::from(reply)), Return::ReadExact(0, 4)];
+                return vec![
+                    Return::Write(0, Bytes::from(reply)),
+                    Return::ReadExact(0, 4),
+                    Return::Register(1, target)
+                ];
             }
         }
         panic!("invalid");
