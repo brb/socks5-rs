@@ -37,7 +37,8 @@ impl FSM for Socks5 {
     }
 
     fn handle_event(&mut self, ev: Event) -> Vec<Return> {
-        println!("handle event");
+        println!("handle event: {:?}", self.inner.next_state);
+
         match self.inner.next_state {
             State::Init => panic!("invalid state"),
             State::ReceiveVsnAndAuthCount => self.inner.receive_vsm_and_auth_count(ev),
@@ -48,7 +49,7 @@ impl FSM for Socks5 {
     }
 }
 
-//#[derive(PartialEq, Debug)]
+#[derive(PartialEq, Debug)]
 enum State {
     // TODO macro?
     Init,
