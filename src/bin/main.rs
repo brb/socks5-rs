@@ -45,18 +45,19 @@ impl FSM for Socks5 {
             State::ReceiveAuthMethods => self.inner.receive_auth_methods(ev),
             State::ReceiveAddrType => self.inner.receive_addr_type(ev),
             State::ReceiveAddr => self.inner.receive_addr(ev),
+            State::Proxy => self.inner.proxy(ev),
         }
     }
 }
 
 #[derive(PartialEq, Debug)]
 enum State {
-    // TODO macro?
     Init,
     ReceiveVsnAndAuthCount,
     ReceiveAuthMethods,
     ReceiveAddrType,
     ReceiveAddr,
+    Proxy,
 }
 
 impl Socks5Inner {
@@ -97,7 +98,6 @@ impl Socks5Inner {
 
     fn receive_addr(&mut self, ev: Event) -> Vec<Return> {
         if let Event::Read(0, ref buf) = ev {
-
             let addr = IpAddr::V4(Ipv4Addr::new(buf[0], buf[1], buf[2], buf[3]));
             let port: u16 = BigEndian::read_u16(&[buf[4], buf[5]][..]);
             let target = TcpStream::connect(&SocketAddr::new(addr, port)).unwrap();
@@ -111,13 +111,29 @@ impl Socks5Inner {
                     ip[0], ip[1], ip[2], ip[3],
                     (port >> 8) as u8, port as u8
                 ];
-                self.next_state = State::Init;
+                self.next_state = State::Proxy;
                 return vec![
                     Return::Write(0, Bytes::from(reply)),
-                    Return::ReadExact(0, 4),
+                    Return::Read(0),
                     Return::Register(1, target),
+                    Return::Read(1),
                 ];
             }
+        }
+        panic!("invalid");
+    }
+
+    fn proxy(&mut self, ev: Event) -> Vec<Return> {
+        if let Event::Read(0, buf) = ev {
+            return vec![
+                Return::Write(1, buf),
+                Return::Read(0),
+            ];
+        } else if let Event::Read(1, buf) = ev {
+            return vec![
+                Return::Write(0, buf),
+                Return::Read(1),
+            ];
         }
         panic!("invalid");
     }
