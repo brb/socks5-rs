@@ -4,7 +4,6 @@ extern crate bytes;
 
 use std::net::SocketAddr;
 use std::cell::RefCell;
-use std::rc::Rc;
 use std::collections::{HashMap, HashSet};
 use std::io::{Read, Write, Error, ErrorKind};
 use self::mio::{Poll, Events, Token, PollOpt, Ready};
@@ -36,7 +35,7 @@ impl FsmConn {
 
 struct FsmState {
     conns: HashMap<ConnRef, FsmConn>,
-    fsm: Rc<RefCell<Box<FSM>>>,
+    fsm: Box<FSM>,
 }
 
 struct Acceptor {
@@ -147,24 +146,19 @@ impl TcpHandler {
     }
 
     fn accept_connection(&self, acceptor: &Acceptor) {
-        let token = self.get_token();
-
         let (socket, _) = acceptor.listener.accept().unwrap();
-
-        let fsm = Rc::new(RefCell::new((acceptor.spawn)()));
+        let token = self.get_token();
+        let fsm = (acceptor.spawn)();
 
         let mut conn = FsmConn::new(socket);
 
         let mut fsm_state = FsmState{
             conns: HashMap::new(),
-            fsm: fsm.clone(),
+            fsm: fsm,
         };
 
-        let fsm = fsm.clone();
-        let mut fsm = fsm.borrow_mut();
-
         // Currently we support only the ReadExact(0, <..>) return
-        if let Return::ReadExact(0, count) = fsm.init() {
+        if let Return::ReadExact(0, count) = fsm_state.fsm.init() {
             conn.req_read_count = Some(count);
             conn.read = true;
         } else {
@@ -226,15 +220,13 @@ impl TcpHandler {
                 }
 
                 let buf = conn.read_buf.split_to(count);
-                let e = Event::Read(cref, buf.freeze());
-                let fsm = fsm_state.fsm.clone();
-                let mut fsm = fsm.borrow_mut();
 
                 // reset
                 conn.req_read_count = None;
                 conn.read = false;
 
-                let mut ret = fsm.handle_event(e);
+                let e = Event::Read(cref, buf.freeze());
+                let mut ret = fsm_state.fsm.handle_event(e);
 
                 // process local read requests
                 self.local_conn_reads(&mut ret, cref, &mut conn);
