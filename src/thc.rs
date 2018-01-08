@@ -1,4 +1,4 @@
-// TODO .clone -> Rc::clone
+// TODO thc -> tcph
 extern crate mio;
 extern crate bytes;
 
@@ -35,7 +35,6 @@ impl FsmConn {
 }
 
 struct FsmState {
-    //fsm_conns: HashMap<ConnRef, RefCell<FsmConn>>,
     fsm_conns: HashMap<ConnRef, FsmConn>,
     fsm: Rc<RefCell<Box<FSM>>>,
 }
@@ -47,7 +46,7 @@ struct Acceptor {
 
 #[derive(Clone, Copy)]
 struct FsmConnId {
-    main_token: Token, // acceptor token; used to identify FsmState
+    main_token: Token, // accepted connection token; used to identify FsmState
     conn_ref: ConnRef,
 }
 
@@ -193,8 +192,6 @@ impl TcpHandler {
         let mut returns = Vec::new();
 
         {
-            //let mut tmp = fsm_state.fsm_conns.get(&cref).unwrap().borrow_mut();
-            //let fsm_conn = &mut *tmp;
             let mut fsm_conn = fsm_state.fsm_conns.get_mut(&cref).unwrap();
 
             // Read from socket
@@ -203,9 +200,10 @@ impl TcpHandler {
                 let socket = Rc::get_mut(rc_socket).unwrap();
                 let buf = &mut fsm_conn.read_buf;
                 let (_, terminate) = read_until_would_block(socket, buf).unwrap();
-                assert!(!terminate); // TODO NYI
                 fsm_conn.read = false;
-                poll_reg.reregister.insert(cref);
+                if !terminate {
+                    poll_reg.reregister.insert(cref);
+                }
             }
 
             // Write to socket
