@@ -15,7 +15,7 @@ use self::bytes::{BytesMut, Bytes, BufMut};
 struct FsmConn {
     socket: Rc<TcpStream>, // TODO minus Rc
     read_buf: BytesMut,
-    req_read_count: usize, // TODO -1 to indicate Read(NonExact)
+    req_read_count: Option<usize>,
     read: bool,
     write_buf: BytesMut,
     write: bool,
@@ -26,7 +26,7 @@ impl FsmConn {
         FsmConn{
             socket: socket,
             read_buf: BytesMut::with_capacity(64 * 1024),
-            req_read_count: 0,
+            req_read_count: None,
             read: false,
             write_buf: BytesMut::with_capacity(64 * 1024),
             write: false,
@@ -121,7 +121,9 @@ impl TcpHandler {
             let token = self.get_token();
             fsm_conn_ids.insert(token, FsmConnId{main_token, conn_ref: cref});
             tokens.insert((main_token, cref), token);
-            self.poll.register(&**socket, token, Ready::empty(), PollOpt::edge() | PollOpt::oneshot()).unwrap();
+            println!("register. token: {:?}", token);
+            // TODO fix it
+            self.poll.register(&**socket, token, Ready::readable(), PollOpt::edge() | PollOpt::oneshot()).unwrap();
         }
 
         for cref in &poll_reg.reregister {
@@ -166,7 +168,7 @@ impl TcpHandler {
 
         // Currently we support only the ReadExact(0, <..>) return
         if let Return::ReadExact(0, count) = fsm.init() {
-            fsm_conn.req_read_count = count;
+            fsm_conn.req_read_count = Some(count);
             fsm_conn.read = true;
         } else {
             panic!("NYI");
@@ -188,7 +190,7 @@ impl TcpHandler {
         println!("handle_poll_events: {:?}", ready);
 
         let mut poll_reg = PollReg{new: Vec::new(), reregister: HashSet::new()};
-        let mut retz = Vec::new();
+        let mut returns = Vec::new();
 
         {
             //let mut tmp = fsm_state.fsm_conns.get(&cref).unwrap().borrow_mut();
@@ -215,53 +217,73 @@ impl TcpHandler {
                 poll_reg.reregister.insert(cref);
             }
 
+            while let Some(c) = fsm_conn.req_read_count {
+                let count;
+                // Read(cref)
+                if c == 0 && fsm_conn.read_buf.len() > 0 {
+                    count = fsm_conn.read_buf.len();
+                // ReadExact(cref)
+                } else if c > 0  && fsm_conn.read_buf.len() >= c {
+                    count = c;
+                } else {
+                    break;
+                }
 
-            while fsm_conn.req_read_count != 0 && fsm_conn.read_buf.len() >= fsm_conn.req_read_count {
-                let buf = fsm_conn.read_buf.split_to(fsm_conn.req_read_count);
+                let buf = fsm_conn.read_buf.split_to(count);
                 let e = Event::Read(cref, buf.freeze());
                 let fsm = fsm_state.fsm.clone();
                 let mut fsm = fsm.borrow_mut();
 
-                fsm_conn.req_read_count = 0;
+                // reset
+                fsm_conn.req_read_count = None;
                 fsm_conn.read = false;
 
                 let mut ret = fsm.handle_event(e);
-                self.fsm_conn_foo(&mut ret, cref, &mut fsm_conn);
-                retz.append(&mut ret);
+
+                // process local read requests
+                self.local_conn_reads(&mut ret, cref, &mut fsm_conn);
+
+                returns.append(&mut ret);
+
             }
         }
 
-        self.handle_fsm_return(retz, cref, fsm_state, &mut poll_reg);
+        self.handle_fsm_return(returns, fsm_state, &mut poll_reg);
 
         return poll_reg;
     }
 
     // -> handle_local_read
-    fn fsm_conn_foo(&self, ret: &mut Vec<Return>, cref: ConnRef, fsm_conn: &mut FsmConn) {
-        for r in ret {
-            match r {
-                &mut Return::ReadExact(cr, ref mut count)
-                    if cr == cref && *count <= fsm_conn.read_buf.len() => {
-                        fsm_conn.req_read_count = *count;
-                        *count = 0; // indicates that return is consumed
+    fn local_conn_reads(&self, returns: &mut Vec<Return>, cref: ConnRef, fsm_conn: &mut FsmConn) {
+        for ret in returns {
+            match ret {
+                &mut Return::ReadExact(cr, count) if cr == cref && count <= fsm_conn.read_buf.len() => {
+                    fsm_conn.req_read_count = Some(count);
+                    *ret = Return::None;
+                },
+                &mut Return::Read(cr) if cr == cref && fsm_conn.read_buf.len() > 0 => {
+                    fsm_conn.req_read_count = Some(0);
+                    *ret = Return::None;
                 },
                 _ => {},
             }
         }
     }
 
-    fn handle_fsm_return(&self, ret: Vec<Return>, cref: ConnRef, fsm_state: &mut FsmState, poll_reg: &mut PollReg) {
-        for r in ret {
-            match r {
-                Return::ReadExact(cr, count) if cr == cref && count == 0 => {
-                    // do nothing
-                },
+    fn handle_fsm_return(&self, returns: Vec<Return>, fsm_state: &mut FsmState, poll_reg: &mut PollReg) {
+        for ret in returns {
+            match ret {
+                Return::None => {},
                 Return::ReadExact(cref, count) => {
                     let mut fsm_conn = fsm_state.fsm_conns.get_mut(&cref).unwrap();
-                    fsm_conn.req_read_count = count;
+                    fsm_conn.req_read_count = Some(count);
                     fsm_conn.read = true;
-                    // TODO there is a bug - fsm_conn.read might be set to false after subsequent
-                    // reads triggered in the while loop
+                    poll_reg.reregister.insert(cref);
+                },
+                Return::Read(cref) => {
+                    let mut fsm_conn = fsm_state.fsm_conns.get_mut(&cref).unwrap();
+                    fsm_conn.req_read_count = Some(0);
+                    fsm_conn.read = true;
                     poll_reg.reregister.insert(cref);
                 },
                 Return::Write(cref, reply) => {
@@ -298,14 +320,14 @@ pub enum Event {
 }
 
 #[derive(Debug)]
-// TODO maybe support multiple Returns (and hence, s/Return/Action)
 // TODO change from Bytes to b[..]
 pub enum Return {
     ReadExact(ConnRef, usize),
     Write(ConnRef, Bytes),
     Register(ConnRef, TcpStream),
+    Read(ConnRef),
+    None,
     //Terminate(ConnRef),
-    //Read(ConnRef),
     //WriteAndTerminate(ConnRef, Bytes),
 }
 
@@ -313,8 +335,6 @@ pub trait FSM {
     fn init(&mut self) -> Return; // TODO maybe vectorize as well?
     fn handle_event(&mut self, ev: Event) -> Vec<Return>;
 }
-
-// --- Helpers
 
 fn read_until_would_block(src: &mut Read, buf: &mut BytesMut) -> Result<(usize, bool), Error> {
     let mut total_size = 0;

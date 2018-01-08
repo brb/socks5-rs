@@ -115,7 +115,7 @@ impl Socks5Inner {
                 return vec![
                     Return::Write(0, Bytes::from(reply)),
                     Return::ReadExact(0, 4),
-                    Return::Register(1, target)
+                    Return::Register(1, target),
                 ];
             }
         }
