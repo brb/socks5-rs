@@ -143,6 +143,7 @@ impl TcpHandler {
     fn handle_poll_events(&self, ready: Ready, cref: ConnRef, fsm_state: &mut FsmState) -> PollReg {
         let mut poll_reg = PollReg{new: Vec::new(), old: HashSet::new()};
         let mut returns = Vec::new();
+        let mut terminate = false;
 
         {
             let mut conn = fsm_state.conns.get_mut(&cref).unwrap();
@@ -150,7 +151,8 @@ impl TcpHandler {
             if ready.is_readable() {
                 let socket = &mut conn.socket;
                 let buf = &mut conn.read_buf;
-                let (_, terminate) = read_until_would_block(socket, buf).unwrap();
+                let (_, t) = read_until_would_block(socket, buf).unwrap();
+                terminate = t;
                 conn.read = false;
                 if !terminate {
                     poll_reg.old.insert(cref);
@@ -165,32 +167,41 @@ impl TcpHandler {
                 poll_reg.old.insert(cref);
             }
 
-            while let Some(c) = conn.req_read_count {
-                let count;
-                // Read(cref)
-                if c == 0 && conn.read_buf.len() > 0 {
-                    count = conn.read_buf.len();
-                // ReadExact(cref)
-                } else if c > 0  && conn.read_buf.len() >= c {
-                    count = c;
-                } else {
-                    break;
-                }
-
-                let buf = conn.read_buf.split_to(count);
-
-                // reset
+            if terminate {
+                let len = conn.read_buf.len();
+                let buf = conn.read_buf.split_to(len);
                 conn.req_read_count = None;
                 conn.read = false;
-
-                let e = Event::Read(cref, buf.freeze());
+                let e = Event::Terminate(cref, buf.freeze());
                 let mut ret = fsm_state.fsm.handle_event(e);
-
-                // process local read requests
-                self.local_conn_reads(&mut ret, cref, &mut conn);
-
                 returns.append(&mut ret);
+            } else {
+                while let Some(c) = conn.req_read_count {
+                    let count;
+                    // Read(cref)
+                    if c == 0 && conn.read_buf.len() > 0 {
+                        count = conn.read_buf.len();
+                    // ReadExact(cref)
+                    } else if c > 0  && conn.read_buf.len() >= c {
+                        count = c;
+                    } else {
+                        break;
+                    }
 
+                    let buf = conn.read_buf.split_to(count);
+
+                    // reset
+                    conn.req_read_count = None;
+                    conn.read = false;
+
+                    let e = Event::Read(cref, buf.freeze());
+                    let mut ret = fsm_state.fsm.handle_event(e);
+
+                    // process local read requests
+                    self.local_conn_reads(&mut ret, cref, &mut conn);
+
+                    returns.append(&mut ret);
+                }
             }
         }
 
@@ -300,8 +311,7 @@ type ConnRef = u64;
 pub enum Event {
     None,
     Read(ConnRef, Bytes),
-    Terminate(ConnRef),
-    //TerminateAfterRead(ConnRef, Bytes), // TODO
+    Terminate(ConnRef, Bytes),
 }
 
 #[derive(Debug)]
@@ -311,7 +321,7 @@ pub enum Return {
     Write(ConnRef, Bytes),
     Register(ConnRef, TcpStream),
     Read(ConnRef),
-    None,
+    None, // For internal usage only
     //Terminate(ConnRef), // TODO
     //WriteAndTerminate(ConnRef, Bytes), // TODO
 }

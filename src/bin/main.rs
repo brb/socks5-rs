@@ -134,6 +134,14 @@ impl Socks5Inner {
                 Return::Write(0, buf),
                 Return::Read(1),
             ];
+        } else if let Event::Terminate(0, buf) = ev {
+            return vec![
+                Return::Write(1, buf),
+            ];
+        } else if let Event::Terminate(1, buf) = ev {
+            return vec![
+                Return::Write(0, buf),
+            ];
         }
         panic!("invalid");
     }
