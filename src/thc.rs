@@ -9,6 +9,7 @@ use std::io::{Read, Write, Error, ErrorKind};
 use self::mio::{Poll, Events, Token, PollOpt, Ready};
 use self::mio::tcp::{TcpListener, TcpStream};
 use self::bytes::{BytesMut, Bytes, BufMut};
+use self::WorkersPool;
 
 #[derive(Debug)]
 struct FsmConn {
@@ -50,6 +51,7 @@ struct ConnId {
 }
 
 pub struct TcpHandler {
+    workers: WorkersPool,
     poll: Poll,
     next_token_index: RefCell<usize>, // for mio poll
     acceptors: HashMap<Token, RefCell<Acceptor>>,
@@ -59,8 +61,9 @@ pub struct TcpHandler {
 }
 
 impl TcpHandler {
-    pub fn new(_workers_pool_size: usize) -> TcpHandler {
+    pub fn new(workers_pool_size: usize) -> TcpHandler {
         TcpHandler{
+            workers: WorkersPool::new(workers_pool_size),
             poll: Poll::new().unwrap(),
             next_token_index: RefCell::new(0),
             acceptors: HashMap::new(),
@@ -86,6 +89,7 @@ impl TcpHandler {
             self.poll.poll(&mut events, None).unwrap();
 
             for event in &events {
+                self.workers.exec(|| { println!("event") });
                 if let Some(acceptor) = self.acceptors.get(&event.token()) {
                     self.accept_connection(&acceptor.borrow());
                 } else {
@@ -102,6 +106,8 @@ impl TcpHandler {
                     }
                     self.poll_reregister(&poll_reg, conn_id.main_token);
                 }
+
+
             }
         }
     }
