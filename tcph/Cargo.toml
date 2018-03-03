@@ -1,12 +1,9 @@
 [package]
-name = "socks5-rs"
+name = "tcph"
 version = "0.1.0"
 authors = ["Martynas Pumputis <martynasp@gmail.com>"]
 
 [dependencies]
 mio = "0.6"
 bytes = "0.4"
-tcph = { path = "tcph" }
-workers = { path = "workers" }
-
-[workspace]
+workers = { path = "../workers" }

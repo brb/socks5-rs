@@ -1,16 +1,27 @@
 use std::thread;
 use std::sync::{mpsc, Mutex, Arc};
 
-pub mod thc;
-
-// why would you use Box(...) ?
-pub struct WorkersPool<T> {
-    tx: mpsc::Sender<T>,
+trait FnBox {
+    fn call_box(self: Box<Self>);
 }
 
-impl<T> WorkersPool<T> where T: FnOnce() + Send + 'static {
-    pub fn new(count: usize) -> WorkersPool<T> {
-        let (tx, rx) = mpsc::channel::<T>();
+impl<F: FnOnce()> FnBox for F {
+    fn call_box(self: Box<F>) {
+        (*self)()
+    }
+}
+
+type Job = Box<FnBox + Send + 'static>;
+
+//type Job = Box<FnOnce() + Send + 'static>;
+
+pub struct WorkersPool {
+    tx: mpsc::Sender<Job>,
+}
+
+impl WorkersPool {
+    pub fn new(count: usize) -> WorkersPool {
+        let (tx, rx) = mpsc::channel::<Job>();
         let chan = Arc::new(Mutex::new(rx));
 
         for _ in 1..count {
@@ -19,7 +30,7 @@ impl<T> WorkersPool<T> where T: FnOnce() + Send + 'static {
             thread::spawn(move || {
                 loop {
                     let f = rx.lock().unwrap().recv().unwrap();
-                    f();
+                    f.call_box();
                 }
             });
 
@@ -28,8 +39,9 @@ impl<T> WorkersPool<T> where T: FnOnce() + Send + 'static {
         WorkersPool {tx: tx }
     }
 
-    pub fn exec(&self, f: T) {
-        self.tx.send(f).unwrap();
+    pub fn exec<F>(&self, f: F) where F: FnOnce() + Send + 'static {
+        let job = Box::new(f);
+        self.tx.send(job).unwrap();
     }
 }
 

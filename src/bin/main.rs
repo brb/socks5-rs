@@ -1,10 +1,9 @@
 extern crate mio;
-extern crate socks5_rs;
+extern crate tcph;
 extern crate bytes;
 
-use socks5_rs::thc;
-use socks5_rs::thc::{FSM, Event, Return};
-use self::bytes::Bytes;
+use tcph::{FSM, Event, Return};
+use bytes::Bytes;
 use bytes::{ByteOrder, BigEndian};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use mio::tcp::TcpStream;
@@ -12,7 +11,7 @@ use mio::tcp::TcpStream;
 const LADDR: &'static str = "127.0.0.1:1080";
 
 fn main() {
-    let mut tcp_handler = thc::TcpHandler::new(4);
+    let mut tcp_handler = tcph::TcpHandler::new(4);
     let addr = LADDR.parse().unwrap();
     fn builder() -> Box<FSM> {
         let s = Socks5{inner: Socks5Inner{next_state: State::Init}};

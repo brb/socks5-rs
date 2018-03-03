@@ -1,15 +1,15 @@
-// TODO thc -> tcph
 extern crate mio;
 extern crate bytes;
+extern crate workers;
 
 use std::net::SocketAddr;
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::io::{Read, Write, Error, ErrorKind};
-use self::mio::{Poll, Events, Token, PollOpt, Ready};
-use self::mio::tcp::{TcpListener, TcpStream};
-use self::bytes::{BytesMut, Bytes, BufMut};
-use self::WorkersPool;
+use mio::{Poll, Events, Token, PollOpt, Ready};
+use mio::tcp::{TcpListener, TcpStream};
+use bytes::{BytesMut, Bytes, BufMut};
+use workers::WorkersPool;
 
 #[derive(Debug)]
 struct FsmConn {
