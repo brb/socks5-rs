@@ -6,6 +6,7 @@ use std::net::SocketAddr;
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::io::{Read, Write, Error, ErrorKind};
+use std::sync::Mutex;
 use mio::{Poll, Events, Token, PollOpt, Ready};
 use mio::tcp::{TcpListener, TcpStream};
 use bytes::{BytesMut, Bytes, BufMut};
@@ -53,11 +54,15 @@ struct ConnId {
 pub struct TcpHandler {
     workers: WorkersPool,
     poll: Poll,
-    next_token_index: RefCell<usize>, // for mio poll
-    acceptors: HashMap<Token, RefCell<Acceptor>>,
+
+    next_token_index: Mutex<usize>, // for mio poll
+
     conn_ids: RefCell<HashMap<Token, ConnId>>,
     tokens: RefCell<HashMap<(Token, ConnRef), Token>>,
+
+    // HashMap -> HashMap<Token, Arc<Mutex<FsmState>>>
     fsm_states: RefCell<HashMap<Token, FsmState>>,
+    acceptors: HashMap<Token, RefCell<Acceptor>>,
 }
 
 impl TcpHandler {
@@ -65,7 +70,7 @@ impl TcpHandler {
         TcpHandler{
             workers: WorkersPool::new(workers_pool_size),
             poll: Poll::new().unwrap(),
-            next_token_index: RefCell::new(0),
+            next_token_index: Mutex::new(0),
             acceptors: HashMap::new(),
             conn_ids: RefCell::new(HashMap::new()),
             fsm_states: RefCell::new(HashMap::new()),
@@ -89,9 +94,10 @@ impl TcpHandler {
             self.poll.poll(&mut events, None).unwrap();
 
             for event in &events {
-                self.workers.exec(|| { println!("event") });
                 if let Some(acceptor) = self.acceptors.get(&event.token()) {
-                    self.accept_connection(&acceptor.borrow());
+                        self.accept_connection(&acceptor.borrow());
+                    //});
+                    // return to producer
                 } else {
                     let conn_id;
                     {
@@ -106,13 +112,13 @@ impl TcpHandler {
                     }
                     self.poll_reregister(&poll_reg, conn_id.main_token);
                 }
-
-
             }
         }
     }
 
     fn accept_connection(&self, acceptor: &Acceptor) {
+
+        //self.workers.exec(|| { self.get_token(); });
         let (socket, _) = acceptor.listener.accept().unwrap();
         let token = self.get_token();
 
@@ -300,8 +306,9 @@ impl TcpHandler {
     }
 
     fn get_token(&self) -> Token {
-        let token = Token(*self.next_token_index.borrow());
-        *self.next_token_index.borrow_mut() += 1;
+        let mut index = self.next_token_index.lock().unwrap();
+        let token = Token(*index);
+        *index += 1;
         token
     }
 }

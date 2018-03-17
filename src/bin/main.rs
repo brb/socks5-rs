@@ -1,24 +1,29 @@
 extern crate mio;
-extern crate tcph;
 extern crate bytes;
+extern crate tcph;
+extern crate workers;
 
 use tcph::{FSM, Event, Return};
 use bytes::Bytes;
 use bytes::{ByteOrder, BigEndian};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use mio::tcp::TcpStream;
+use workers::WorkersPool;
 
 const LADDR: &'static str = "127.0.0.1:1080";
 
 fn main() {
-    let mut tcp_handler = tcph::TcpHandler::new(4);
-    let addr = LADDR.parse().unwrap();
-    fn builder() -> Box<FSM> {
-        let s = Socks5{inner: Socks5Inner{next_state: State::Init}};
-        Box::new(s)
-    };
-    tcp_handler.register(&addr, builder);
-    tcp_handler.run().unwrap();
+    //let mut tcp_handler = tcph::TcpHandler::new(4);
+    //let addr = LADDR.parse().unwrap();
+    //fn builder() -> Box<FSM> {
+    //    let s = Socks5{inner: Socks5Inner{next_state: State::Init}};
+    //    Box::new(s)
+    //};
+    //tcp_handler.register(&addr, builder);
+    //tcp_handler.run().unwrap();
+
+    let wp = WorkersPool::new(4);
+
 }
 
 struct Socks5Inner {
