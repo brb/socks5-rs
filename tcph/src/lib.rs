@@ -6,11 +6,14 @@ use std::net::SocketAddr;
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::io::{Read, Write, Error, ErrorKind};
-use std::sync::Mutex;
+use std::sync::{mpsc, Mutex};
 use mio::{Poll, Events, Token, PollOpt, Ready};
 use mio::tcp::{TcpListener, TcpStream};
 use bytes::{BytesMut, Bytes, BufMut};
 use workers::WorkersPool;
+
+// A token for notifying about registration request in a channel
+const REG_TOKEN: Token = Token(0);
 
 #[derive(Debug)]
 struct FsmConn {
@@ -63,18 +66,25 @@ pub struct TcpHandler {
     // HashMap -> HashMap<Token, Arc<Mutex<FsmState>>>
     fsm_states: RefCell<HashMap<Token, FsmState>>,
     acceptors: HashMap<Token, RefCell<Acceptor>>,
+
+    rx: mpsc::Receiver<PollReg>,
+    tx: mpsc::Sender<PollReg>,
 }
 
 impl TcpHandler {
     pub fn new(workers_pool_size: usize) -> TcpHandler {
+        let (tx, rx) = mpsc::channel();
+
         TcpHandler{
             workers: WorkersPool::new(workers_pool_size),
             poll: Poll::new().unwrap(),
-            next_token_index: Mutex::new(0),
+            next_token_index: Mutex::new(1),
             acceptors: HashMap::new(),
             conn_ids: RefCell::new(HashMap::new()),
             fsm_states: RefCell::new(HashMap::new()),
             tokens: RefCell::new(HashMap::new()),
+            rx: rx,
+            tx: tx,
         }
     }
 
@@ -89,12 +99,20 @@ impl TcpHandler {
     }
 
    pub fn run(&mut self) -> Result<(), ()> {
+        let (registration, set_readiness) = mio::Registration::new2();
+
+        self.poll.register(&registration, REG_TOKEN, Ready::readable(), PollOpt::edge()).unwrap();
+
         loop {
             let mut events = Events::with_capacity(1024);
             self.poll.poll(&mut events, None).unwrap();
 
             for event in &events {
-                if let Some(acceptor) = self.acceptors.get(&event.token()) {
+                if event.token() == REG_TOKEN {
+                    if let Ok(poll_reg) = self.rx.try_recv() {
+                        self.poll_reregister(&poll_reg, poll_reg.main_token);
+                    }
+                } else if let Some(acceptor) = self.acceptors.get(&event.token()) {
                         self.accept_connection(&acceptor.borrow());
                     //});
                     // return to producer
@@ -104,13 +122,16 @@ impl TcpHandler {
                         let f = self.conn_ids.borrow();
                         conn_id = *f.get(&event.token()).unwrap();
                     }
-                    let poll_reg;
+                    let mut poll_reg;
                     {
                         let mut f = self.fsm_states.borrow_mut();
                         let fsm_state = f.get_mut(&conn_id.main_token).unwrap();
                         poll_reg = self.handle_poll_events(event.readiness(), conn_id.cref, fsm_state);
                     }
-                    self.poll_reregister(&poll_reg, conn_id.main_token);
+                    poll_reg.main_token = conn_id.main_token;
+                    self.tx.send(poll_reg).unwrap();
+                    set_readiness.set_readiness(Ready::readable()).unwrap();
+                    //self.poll_reregister(&poll_reg, conn_id.main_token);
                 }
             }
         }
@@ -153,7 +174,7 @@ impl TcpHandler {
     }
 
     fn handle_poll_events(&self, ready: Ready, cref: ConnRef, fsm_state: &mut FsmState) -> PollReg {
-        let mut poll_reg = PollReg{new: Vec::new(), old: HashSet::new()};
+        let mut poll_reg = PollReg{new: Vec::new(), old: HashSet::new(), main_token: Token(0)};
         let mut returns = Vec::new();
         let mut terminate = false;
 
@@ -239,6 +260,7 @@ impl TcpHandler {
 
         for cref in &poll_reg.old {
             let f = self.fsm_states.borrow();
+            println!("main_token: {:?}", main_token);
             let conn = f.get(&main_token).unwrap().conns.get(cref).unwrap();
 
             let mut ready = Ready::empty();
@@ -316,6 +338,7 @@ impl TcpHandler {
 struct PollReg {
     new: Vec<ConnRef>,
     old: HashSet<ConnRef>,
+    main_token: Token,
 }
 
 type ConnRef = u64;
