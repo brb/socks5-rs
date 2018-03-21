@@ -59,23 +59,18 @@ pub struct TcpHandler {
     workers: WorkersPool,
     poll: Poll,
 
+    // TODO
     next_token_index: Mutex<usize>, // for mio poll
 
     conn_ids: RefCell<HashMap<Token, ConnId>>,
     tokens: RefCell<HashMap<(Token, ConnRef), Token>>,
 
-    // HashMap -> HashMap<Token, Arc<Mutex<FsmState>>>
-    //fsm_states: RefCell<HashMap<Token, FsmState>>,
     fsm_states: HashMap<Token, Arc<Mutex<FsmState>>>,
     acceptors: HashMap<Token, Arc<Mutex<Acceptor>>>,
-
-    rx: mpsc::Receiver<GiveMeWork>,
-    tx: mpsc::Sender<GiveMeWork>,
 }
 
 impl TcpHandler {
     pub fn new(workers_pool_size: usize) -> TcpHandler {
-        let (tx, rx) = mpsc::channel();
 
         TcpHandler{
             workers: WorkersPool::new(workers_pool_size),
@@ -83,11 +78,8 @@ impl TcpHandler {
             next_token_index: Mutex::new(1),
             acceptors: HashMap::new(),
             conn_ids: RefCell::new(HashMap::new()),
-            //fsm_states: RefCell::new(HashMap::new()),
             fsm_states: HashMap::new(),
             tokens: RefCell::new(HashMap::new()),
-            rx: rx,
-            tx: tx,
         }
     }
 
@@ -102,6 +94,7 @@ impl TcpHandler {
     }
 
    pub fn run(&mut self) -> Result<(), ()> {
+        let (tx, rx) = mpsc::channel::<GiveMeWork>();
         let (registration, set_readiness) = mio::Registration::new2();
 
         self.poll.register(&registration, REG_TOKEN, Ready::readable(), PollOpt::edge()).unwrap();
@@ -112,7 +105,7 @@ impl TcpHandler {
 
             for event in &events {
                 if event.token() == REG_TOKEN {
-                    if let Ok(work) = self.rx.try_recv() {
+                    if let Ok(work) = rx.try_recv() {
                         match work {
                             GiveMeWork::Acc(acc) => {
                                 let a = Arc::new(Mutex::new(acc.fsm_state));
@@ -133,7 +126,7 @@ impl TcpHandler {
                     }
                 } else if let Some(acceptor) = self.acceptors.get(&event.token()) {
                         let token = self.get_token();
-                        let tx = self.tx.clone();
+                        let tx = tx.clone();
                         let set_ready = set_readiness.clone();
                         let acceptor = acceptor.clone();
 
@@ -152,7 +145,7 @@ impl TcpHandler {
                     let mut f = &self.fsm_states;
                     let fsm_state = f.get(&conn_id.main_token).unwrap();
                     let set_ready = set_readiness.clone();
-                    let tx = self.tx.clone();
+                    let tx = tx.clone();
                     let fsm_state = fsm_state.clone();
 
                     self.workers.exec(move || {
