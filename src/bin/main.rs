@@ -13,7 +13,7 @@ use workers::WorkersPool;
 const LADDR: &'static str = "127.0.0.1:1080";
 
 fn main() {
-    let mut tcp_handler = tcph::TcpHandler::new(4);
+    let mut tcp_handler = tcph::TcpHandler::new(5);
     let addr = LADDR.parse().unwrap();
     fn builder() -> Box<FSM> {
         let s = Socks5{inner: Socks5Inner{next_state: State::Init}};

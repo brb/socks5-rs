@@ -3,10 +3,11 @@ extern crate bytes;
 extern crate workers;
 
 use std::net::SocketAddr;
+use std::thread;
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::io::{Read, Write, Error, ErrorKind};
-use std::sync::{mpsc, Mutex};
+use std::sync::{mpsc, Arc, Mutex};
 use mio::{Poll, Events, Token, PollOpt, Ready};
 use mio::tcp::{TcpListener, TcpStream};
 use bytes::{BytesMut, Bytes, BufMut};
@@ -65,7 +66,8 @@ pub struct TcpHandler {
 
     // HashMap -> HashMap<Token, Arc<Mutex<FsmState>>>
     fsm_states: RefCell<HashMap<Token, FsmState>>,
-    acceptors: HashMap<Token, RefCell<Acceptor>>,
+    // TODO -> Arc<Mutex<Acceptor>>
+    acceptors: HashMap<Token, Arc<Mutex<Acceptor>>>,
 
     rx: mpsc::Receiver<GiveMeWork>,
     tx: mpsc::Sender<GiveMeWork>,
@@ -95,7 +97,7 @@ impl TcpHandler {
         // TODO Fix the order of statements below: we can get notified about
         //      a new listener before acceptor has been inserted.
         self.poll.register(&listener, token, Ready::readable(), PollOpt::edge()).unwrap();
-        self.acceptors.insert(token, RefCell::new(Acceptor{listener, spawn}));
+        self.acceptors.insert(token, Arc::new(Mutex::new(Acceptor{listener, spawn})));
     }
 
    pub fn run(&mut self) -> Result<(), ()> {
@@ -130,10 +132,19 @@ impl TcpHandler {
                     }
                 } else if let Some(acceptor) = self.acceptors.get(&event.token()) {
                         let token = self.get_token();
-                        let a = accept_connection(&acceptor.borrow(), token);
-                        self.tx.send(GiveMeWork::Acc(a)).unwrap();
-                        set_readiness.set_readiness(Ready::readable()).unwrap();
+                        let tx = self.tx.clone();
+                        let set_ready = set_readiness.clone();
+                        let acceptor = acceptor.clone();
+
+                        self.workers.exec(move || {
+                            let a = accept_connection(&acceptor.lock().unwrap(), token);
+                            tx.send(GiveMeWork::Acc(a)).unwrap();
+                            set_ready.set_readiness(Ready::readable()).unwrap();
+                        });
+
+
                 } else {
+
                     let conn_id;
                     {
                         let f = self.conn_ids.borrow();
@@ -149,14 +160,13 @@ impl TcpHandler {
                     self.tx.send(GiveMeWork::Reg(poll_reg)).unwrap();
                     set_readiness.set_readiness(Ready::readable()).unwrap();
                     //self.poll_reregister(&poll_reg, conn_id.main_token);
+
                 }
             }
         }
     }
 
     // TODO Accept -> AcceptResult
-
-    
 
     fn poll_reregister(&self, poll_reg: &PollReg, main_token: Token) {
         let mut conn_ids = self.conn_ids.borrow_mut();
@@ -192,9 +202,6 @@ impl TcpHandler {
         }
     }
 
-
-
-    
 
     fn get_token(&self) -> Token {
         let mut index = self.next_token_index.lock().unwrap();
@@ -241,7 +248,7 @@ pub enum Return {
     //WriteAndTerminate(ConnRef, Bytes), // TODO
 }
 
-pub trait FSM {
+pub trait FSM: Send + Sync {
     fn init(&mut self) -> Return;
     fn handle_event(&mut self, ev: Event) -> Vec<Return>;
 }
