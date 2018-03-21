@@ -149,18 +149,19 @@ impl TcpHandler {
                     let conn_id;
                     let f = self.conn_ids.borrow();
                     conn_id = *f.get(&event.token()).unwrap();
-                    let mut poll_reg;
                     let mut f = &self.fsm_states;
                     let fsm_state = f.get(&conn_id.main_token).unwrap();
+                    let set_ready = set_readiness.clone();
+                    let tx = self.tx.clone();
+                    let fsm_state = fsm_state.clone();
 
-                    //self.workers.exec(move || {
+                    self.workers.exec(move || {
                         let fsm_state = &mut *(fsm_state.lock().unwrap());
-                        
-                        poll_reg = handle_poll_events(event.readiness(), conn_id.cref, fsm_state);
+                        let mut poll_reg = handle_poll_events(event.readiness(), conn_id.cref, fsm_state);
                         poll_reg.main_token = conn_id.main_token;
-                        self.tx.send(GiveMeWork::Reg(poll_reg)).unwrap();
-                        set_readiness.set_readiness(Ready::readable()).unwrap();
-                    //});
+                        tx.send(GiveMeWork::Reg(poll_reg)).unwrap();
+                        set_ready.set_readiness(Ready::readable()).unwrap();
+                    });
                     //self.poll_reregister(&poll_reg, conn_id.main_token);
 
                 }
