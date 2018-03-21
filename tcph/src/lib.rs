@@ -3,7 +3,6 @@ extern crate bytes;
 extern crate workers;
 
 use std::net::SocketAddr;
-use std::thread;
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::io::{Read, Write, Error, ErrorKind};
@@ -13,7 +12,7 @@ use mio::tcp::{TcpListener, TcpStream};
 use bytes::{BytesMut, Bytes, BufMut};
 use workers::WorkersPool;
 
-// A token for notifying about registration request in a channel
+// A mio token for notifying about registration request in a channel
 const REG_TOKEN: Token = Token(0);
 
 #[derive(Debug)]
@@ -55,14 +54,17 @@ struct ConnId {
     cref: ConnRef,
 }
 
+struct TcpHandlerInner {
+    next_token_index: usize,
+    conn_ids: HashMap<Token, ConnId>,
+}
+
 pub struct TcpHandler {
     workers: WorkersPool,
     poll: Poll,
+    inner: TcpHandlerInner,
 
-    // TODO
-    next_token_index: Mutex<usize>, // for mio poll
-
-    conn_ids: RefCell<HashMap<Token, ConnId>>,
+    // TODO move to inner?
     tokens: RefCell<HashMap<(Token, ConnRef), Token>>,
 
     fsm_states: HashMap<Token, Arc<Mutex<FsmState>>>,
@@ -75,17 +77,16 @@ impl TcpHandler {
         TcpHandler{
             workers: WorkersPool::new(workers_pool_size),
             poll: Poll::new().unwrap(),
-            next_token_index: Mutex::new(1),
-            acceptors: HashMap::new(),
-            conn_ids: RefCell::new(HashMap::new()),
             fsm_states: HashMap::new(),
             tokens: RefCell::new(HashMap::new()),
+            acceptors: HashMap::new(),
+            inner: TcpHandlerInner{next_token_index: 1, conn_ids: HashMap::new()},
         }
     }
 
     pub fn register(&mut self, addr: &SocketAddr, spawn: fn() -> Box<FSM>) {
         let listener = TcpListener::bind(addr).unwrap();
-        let token = self.get_token();
+        let token = self.inner.get_token();
 
         // TODO Fix the order of statements below: we can get notified about
         //      a new listener before acceptor has been inserted.
@@ -110,7 +111,7 @@ impl TcpHandler {
                             GiveMeWork::Acc(acc) => {
                                 let a = Arc::new(Mutex::new(acc.fsm_state));
                                 self.fsm_states.insert(acc.token, Arc::clone(&a));
-                                self.conn_ids.borrow_mut().insert(acc.token, ConnId{main_token: acc.token, cref: 0});
+                                self.inner.conn_ids.insert(acc.token, ConnId{main_token: acc.token, cref: 0});
 
                                 // Dirty hack to get a reference to the socket moved above ^^.
                                 let fsm_state = &*(a.lock().unwrap());
@@ -125,7 +126,7 @@ impl TcpHandler {
                         }
                     }
                 } else if let Some(acceptor) = self.acceptors.get(&event.token()) {
-                        let token = self.get_token();
+                        let token = self.inner.get_token();
                         let tx = tx.clone();
                         let set_ready = set_readiness.clone();
                         let acceptor = acceptor.clone();
@@ -139,9 +140,7 @@ impl TcpHandler {
 
                 } else {
 
-                    let conn_id;
-                    let f = self.conn_ids.borrow();
-                    conn_id = *f.get(&event.token()).unwrap();
+                    let conn_id = *(self.inner.conn_ids.get(&event.token()).unwrap());
                     let mut f = &self.fsm_states;
                     let fsm_state = f.get(&conn_id.main_token).unwrap();
                     let set_ready = set_readiness.clone();
@@ -155,8 +154,6 @@ impl TcpHandler {
                         tx.send(GiveMeWork::Reg(poll_reg)).unwrap();
                         set_ready.set_readiness(Ready::readable()).unwrap();
                     });
-                    //self.poll_reregister(&poll_reg, conn_id.main_token);
-
                 }
             }
         }
@@ -164,13 +161,12 @@ impl TcpHandler {
 
     // TODO Accept -> AcceptResult
 
-    fn poll_reregister(&self, poll_reg: &PollReg, main_token: Token) {
-        let mut conn_ids = self.conn_ids.borrow_mut();
+    fn poll_reregister(&mut self, poll_reg: &PollReg, main_token: Token) {
         let mut tokens = self.tokens.borrow_mut();
 
         for cref in &poll_reg.new {
-            let token = self.get_token();
-            conn_ids.insert(token, ConnId{main_token, cref: *cref});
+            let token = self.inner.get_token();
+            self.inner.conn_ids.insert(token, ConnId{main_token, cref: *cref});
             tokens.insert((main_token, *cref), token);
 
             let f = &self.fsm_states;
@@ -202,12 +198,12 @@ impl TcpHandler {
             self.poll.reregister(&conn.socket, token, ready, PollOpt::edge() | PollOpt::oneshot()).unwrap();
         }
     }
+}
 
-
-    fn get_token(&self) -> Token {
-        let mut index = self.next_token_index.lock().unwrap();
-        let token = Token(*index);
-        *index += 1;
+impl TcpHandlerInner {
+    fn get_token(&mut self) -> Token {
+        let token = Token(self.next_token_index);
+        self.next_token_index += 1;
         token
     }
 }
