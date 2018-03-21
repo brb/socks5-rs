@@ -57,15 +57,13 @@ struct ConnId {
 struct TcpHandlerInner {
     next_token_index: usize,
     conn_ids: HashMap<Token, ConnId>,
+    tokens: HashMap<(Token, ConnRef), Token>,
 }
 
 pub struct TcpHandler {
     workers: WorkersPool,
     poll: Poll,
     inner: TcpHandlerInner,
-
-    // TODO move to inner?
-    tokens: RefCell<HashMap<(Token, ConnRef), Token>>,
 
     fsm_states: HashMap<Token, Arc<Mutex<FsmState>>>,
     acceptors: HashMap<Token, Arc<Mutex<Acceptor>>>,
@@ -78,9 +76,12 @@ impl TcpHandler {
             workers: WorkersPool::new(workers_pool_size),
             poll: Poll::new().unwrap(),
             fsm_states: HashMap::new(),
-            tokens: RefCell::new(HashMap::new()),
             acceptors: HashMap::new(),
-            inner: TcpHandlerInner{next_token_index: 1, conn_ids: HashMap::new()},
+            inner: TcpHandlerInner{
+                next_token_index: 1,
+                conn_ids: HashMap::new(),
+                tokens: HashMap::new(),
+            },
         }
     }
 
@@ -162,12 +163,10 @@ impl TcpHandler {
     // TODO Accept -> AcceptResult
 
     fn poll_reregister(&mut self, poll_reg: &PollReg, main_token: Token) {
-        let mut tokens = self.tokens.borrow_mut();
-
         for cref in &poll_reg.new {
             let token = self.inner.get_token();
             self.inner.conn_ids.insert(token, ConnId{main_token, cref: *cref});
-            tokens.insert((main_token, *cref), token);
+            self.inner.tokens.insert((main_token, *cref), token);
 
             let f = &self.fsm_states;
             let fsm_state = f.get(&main_token).unwrap();
@@ -193,7 +192,7 @@ impl TcpHandler {
             if *cref == 0 {
                 token = main_token;
             } else {
-                token = *tokens.get(&(main_token, *cref)).unwrap();
+                token = *self.inner.tokens.get(&(main_token, *cref)).unwrap();
             }
             self.poll.reregister(&conn.socket, token, ready, PollOpt::edge() | PollOpt::oneshot()).unwrap();
         }
