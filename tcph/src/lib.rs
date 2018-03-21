@@ -65,8 +65,8 @@ pub struct TcpHandler {
     tokens: RefCell<HashMap<(Token, ConnRef), Token>>,
 
     // HashMap -> HashMap<Token, Arc<Mutex<FsmState>>>
-    fsm_states: RefCell<HashMap<Token, FsmState>>,
-    // TODO -> Arc<Mutex<Acceptor>>
+    //fsm_states: RefCell<HashMap<Token, FsmState>>,
+    fsm_states: HashMap<Token, Arc<Mutex<FsmState>>>,
     acceptors: HashMap<Token, Arc<Mutex<Acceptor>>>,
 
     rx: mpsc::Receiver<GiveMeWork>,
@@ -83,7 +83,8 @@ impl TcpHandler {
             next_token_index: Mutex::new(1),
             acceptors: HashMap::new(),
             conn_ids: RefCell::new(HashMap::new()),
-            fsm_states: RefCell::new(HashMap::new()),
+            //fsm_states: RefCell::new(HashMap::new()),
+            fsm_states: HashMap::new(),
             tokens: RefCell::new(HashMap::new()),
             rx: rx,
             tx: tx,
@@ -114,12 +115,12 @@ impl TcpHandler {
                     if let Ok(work) = self.rx.try_recv() {
                         match work {
                             GiveMeWork::Acc(acc) => {
-                                self.fsm_states.borrow_mut().insert(acc.token, acc.fsm_state);
+                                let a = Arc::new(Mutex::new(acc.fsm_state));
+                                self.fsm_states.insert(acc.token, Arc::clone(&a));
                                 self.conn_ids.borrow_mut().insert(acc.token, ConnId{main_token: acc.token, cref: 0});
 
                                 // Dirty hack to get a reference to the socket moved above ^^.
-                                let fsm_state = self.fsm_states.borrow();
-                                let fsm_state = fsm_state.get(&acc.token).unwrap();
+                                let fsm_state = &*(a.lock().unwrap());
                                 let conn = fsm_state.conns.get(&0).unwrap();
 
                                 // Because of the fsm.init() return limitation, we register the socket as readable.
@@ -146,19 +147,20 @@ impl TcpHandler {
                 } else {
 
                     let conn_id;
-                    {
-                        let f = self.conn_ids.borrow();
-                        conn_id = *f.get(&event.token()).unwrap();
-                    }
+                    let f = self.conn_ids.borrow();
+                    conn_id = *f.get(&event.token()).unwrap();
                     let mut poll_reg;
-                    {
-                        let mut f = self.fsm_states.borrow_mut();
-                        let fsm_state = f.get_mut(&conn_id.main_token).unwrap();
+                    let mut f = &self.fsm_states;
+                    let fsm_state = f.get(&conn_id.main_token).unwrap();
+
+                    //self.workers.exec(move || {
+                        let fsm_state = &mut *(fsm_state.lock().unwrap());
+                        
                         poll_reg = handle_poll_events(event.readiness(), conn_id.cref, fsm_state);
-                    }
-                    poll_reg.main_token = conn_id.main_token;
-                    self.tx.send(GiveMeWork::Reg(poll_reg)).unwrap();
-                    set_readiness.set_readiness(Ready::readable()).unwrap();
+                        poll_reg.main_token = conn_id.main_token;
+                        self.tx.send(GiveMeWork::Reg(poll_reg)).unwrap();
+                        set_readiness.set_readiness(Ready::readable()).unwrap();
+                    //});
                     //self.poll_reregister(&poll_reg, conn_id.main_token);
 
                 }
@@ -177,16 +179,21 @@ impl TcpHandler {
             conn_ids.insert(token, ConnId{main_token, cref: *cref});
             tokens.insert((main_token, *cref), token);
 
-            let f = self.fsm_states.borrow();
-            let conn = f.get(&main_token).unwrap().conns.get(cref).unwrap();
+            let f = &self.fsm_states;
+            let fsm_state = f.get(&main_token).unwrap();
+            let fsm_state = fsm_state.lock().unwrap();
+            let conn = (*fsm_state).conns.get(cref).unwrap();
             // TODO s/readable/?/
             self.poll.register(&conn.socket, token, Ready::readable(), PollOpt::edge() | PollOpt::oneshot()).unwrap();
         }
 
         for cref in &poll_reg.old {
-            let f = self.fsm_states.borrow();
+            let f = &self.fsm_states;
             println!("main_token: {:?}", main_token);
-            let conn = f.get(&main_token).unwrap().conns.get(cref).unwrap();
+
+            let fsm_state = f.get(&main_token).unwrap();
+            let fsm_state = fsm_state.lock().unwrap();
+            let conn = (*fsm_state).conns.get(cref).unwrap();
 
             let mut ready = Ready::empty();
             if conn.read { ready = ready | Ready::readable(); }
