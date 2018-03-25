@@ -186,8 +186,10 @@ impl TcpHandler {
                                 let conn = fsm_state.conns.get(&0).unwrap();
                                 self.poll.register(&conn.socket, a.token, Ready::readable(), PollOpt::edge() | PollOpt::oneshot()).unwrap();
                            },
-                           PollRegReq::H(poll_reg) => {
-                               self.poll_reregister(&poll_reg, poll_reg.main_token);
+                           PollRegReq::H(h) => {
+                               let fsm_state = Arc::clone(&self.fsm_states.get(&h.main_token).unwrap());
+                               let fsm_state = fsm_state.lock().unwrap();
+                               self.poll_reregister(&h, h.main_token, &fsm_state);
                            }
                         }
                     }
@@ -225,27 +227,18 @@ impl TcpHandler {
         }
     }
 
-    // TODO Pass locked fsm_state instead of main_token
-    fn poll_reregister(&mut self, poll_reg: &HandleEventsResult, main_token: Token) {
+    fn poll_reregister(&mut self, poll_reg: &HandleEventsResult, main_token: Token, fsm_state: &FsmState) {
         for cref in &poll_reg.new {
             let token = self.inner.get_token();
             self.inner.conn_ids.insert(token, GlobalConnRef{main_token, cref: *cref});
             self.inner.tokens.insert((main_token, *cref), token);
 
-            let f = &self.fsm_states;
-            let fsm_state = f.get(&main_token).unwrap();
-            let fsm_state = fsm_state.lock().unwrap();
             let conn = (*fsm_state).conns.get(cref).unwrap();
-            // TODO s/readable/?/
             println!("register: {:?} Readable", token);
             self.poll.register(&conn.socket, token, Ready::readable(), PollOpt::edge() | PollOpt::oneshot()).unwrap();
         }
 
         for cref in &poll_reg.old {
-            let f = &self.fsm_states;
-
-            let fsm_state = f.get(&main_token).unwrap();
-            let fsm_state = fsm_state.lock().unwrap();
             let conn = (*fsm_state).conns.get(cref).unwrap();
 
             let mut ready = Ready::empty();
