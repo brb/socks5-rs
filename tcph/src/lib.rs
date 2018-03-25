@@ -157,7 +157,7 @@ impl TcpHandler {
         self.acceptors.insert(token, Arc::new(Mutex::new(Acceptor{listener, spawn})));
     }
 
-   pub fn run(&mut self) -> Result<(), ()> {
+   pub fn run(&mut self) {
         let mut events = Events::with_capacity(1024);
 
         let (tx, rx) = mpsc::channel::<PollRegReq>();
@@ -165,37 +165,33 @@ impl TcpHandler {
         self.poll.register(&registration, REG_TOKEN, Ready::readable(), PollOpt::edge()).unwrap();
 
         loop {
-            println!("loop!");
+            println!("loop: start");
             self.poll.poll(&mut events, None).unwrap();
             for event in &events {
                 println!("got event: {:?}", event);
+
                 if event.token() == REG_TOKEN {
-                    println!("REG_TOKEN");
-                    loop {
-                        if let Ok(work) = rx.try_recv() {
-                            match work {
-                                PollRegReq::A(acc) => {
-                                    let a = Arc::new(Mutex::new(acc.fsm_state));
-                                    self.fsm_states.insert(acc.token, Arc::clone(&a));
-                                    self.inner.conn_ids.insert(acc.token, GlobalConnRef{main_token: acc.token, cref: 0});
-
-                                    // TODO ^^ no need?
-                                    // Dirty hack to get a reference to the socket moved above ^^.
-                                    let fsm_state = &*(a.lock().unwrap());
-                                    let conn = fsm_state.conns.get(&0).unwrap();
-
-                                    // Because of the fsm.init() return limitation, we register the socket as readable.
-                                    self.poll.register(&conn.socket, acc.token, Ready::readable(), PollOpt::edge() | PollOpt::oneshot()).unwrap();
-                                },
-                                PollRegReq::H(poll_reg) => {
-                                    self.poll_reregister(&poll_reg, poll_reg.main_token);
-                                }
-                            }
-                        } else {
-                            break;
+                    println!("REG_TOKEN: start");
+                    while let Ok(req) = rx.try_recv() {
+                        match req {
+                            PollRegReq::A(a) => {
+                                let fsm_state = Arc::new(Mutex::new(a.fsm_state));
+                                self.fsm_states.insert(a.token, Arc::clone(&fsm_state));
+                                self.inner.conn_ids.insert(
+                                    a.token,
+                                    GlobalConnRef{main_token: a.token, cref: 0}
+                                );
+                                // Dirty hack to get a reference to the socket moved above ^^.
+                                let fsm_state = fsm_state.lock().unwrap();
+                                let conn = fsm_state.conns.get(&0).unwrap();
+                                self.poll.register(&conn.socket, a.token, Ready::readable(), PollOpt::edge() | PollOpt::oneshot()).unwrap();
+                           },
+                           PollRegReq::H(poll_reg) => {
+                               self.poll_reregister(&poll_reg, poll_reg.main_token);
+                           }
                         }
                     }
-                    println!("DONE with REG_TOKEN");
+                    println!("REG_TOKEN: end");
                 } else if let Some(acceptor) = self.acceptors.get(&event.token()) {
                         let token = self.inner.get_token();
                         let tx = tx.clone();
@@ -229,6 +225,7 @@ impl TcpHandler {
         }
     }
 
+    // TODO Pass locked fsm_state instead of main_token
     fn poll_reregister(&mut self, poll_reg: &HandleEventsResult, main_token: Token) {
         for cref in &poll_reg.new {
             let token = self.inner.get_token();

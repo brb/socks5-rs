@@ -19,7 +19,7 @@ fn main() {
         Box::new(s)
     };
     tcp_handler.register(&addr, builder);
-    tcp_handler.run().unwrap();
+    tcp_handler.run();
 
 }
 
