@@ -64,27 +64,12 @@ struct Acceptor {
 /// Global TCP connection identifier.
 #[derive(Clone, Copy)]
 struct GlobalConnRef {
-    /// Token of an accepted by TCP listener connection which is used to identify
-    /// an instance of an FSM.
+    /// Token of an accepted by TCP listener connection.
+    ///
+    /// Token can be used to identify an instance of FSM.
     main_token: Token,
-    /// Local TCP connection identifier
+    /// Local TCP connection identifier.
     cref: ConnRef,
-}
-
-struct AcceptConnResult {
-    token: Token,
-    fsm_state: FsmState,
-}
-
-struct HandleEventsResult {
-    main_token: Token,
-    new: Vec<ConnRef>,
-    old: HashSet<ConnRef>,
-}
-
-enum PollRegReq {
-    A(AcceptConnResult),
-    H(HandleEventsResult),
 }
 
 /// FSM trait
@@ -130,6 +115,26 @@ pub struct TcpHandler {
     acceptors: HashMap<Token, Arc<Mutex<Acceptor>>>,
 }
 
+// ----------------------------------
+
+struct AcceptConnResult {
+    token: Token,
+    fsm_state: FsmState,
+}
+
+struct HandleEventsResult {
+    main_token: Token,
+    new: Vec<ConnRef>,
+    old: HashSet<ConnRef>,
+}
+
+enum PollRegReq {
+    A(AcceptConnResult),
+    H(HandleEventsResult),
+}
+
+// ----------------------------------
+
 impl TcpHandler {
     pub fn new(workers_pool_size: usize) -> TcpHandler {
         TcpHandler{
@@ -149,7 +154,6 @@ impl TcpHandler {
         //     we can get notified about a new listener before the acceptor has
         //     been inserted.
         self.poll.register(&listener, token, Ready::readable(), PollOpt::edge()).unwrap();
-        // TODO reregister listener after shot?
         self.acceptors.insert(token, Arc::new(Mutex::new(Acceptor{listener, spawn})));
     }
 
@@ -162,9 +166,7 @@ impl TcpHandler {
 
         loop {
             println!("loop!");
-
             self.poll.poll(&mut events, None).unwrap();
-
             for event in &events {
                 println!("got event: {:?}", event);
                 if event.token() == REG_TOKEN {
@@ -208,7 +210,6 @@ impl TcpHandler {
 
 
                 } else {
-
                     let conn_id = *(self.inner.conn_ids.get(&event.token()).unwrap());
                     let mut f = &self.fsm_states;
                     let fsm_state = f.get(&conn_id.main_token).unwrap();
@@ -283,30 +284,30 @@ impl TcpHandlerInner {
 }
 
 fn accept_connection(acceptor: &Acceptor, token: Token) -> AcceptConnResult {
-        let (socket, _) = acceptor.listener.accept().unwrap();
+    let (socket, _) = acceptor.listener.accept().unwrap();
 
-        // Create an FSM instance
-        let fsm = (acceptor.spawn)();
-        let mut conn = FsmConn::new(socket);
-        let mut fsm_state = FsmState{
-            conns: HashMap::new(),
-            fsm: fsm,
-        };
+    // Create an FSM instance
+    let fsm = (acceptor.spawn)();
+    let mut conn = FsmConn::new(socket);
+    let mut fsm_state = FsmState{
+        conns: HashMap::new(),
+        fsm: fsm,
+    };
 
-        // Currently, only ReadExact(0, <..>) is supported in fsm.init() return
-        if let Return::ReadExact(0, count) = fsm_state.fsm.init() {
-            conn.read_count = Some(count);
-            conn.read = true;
-        } else {
-            panic!("NYI");
-        }
+    // Currently, only ReadExact(0, <..>) is supported in fsm.init() return
+    if let Return::ReadExact(0, count) = fsm_state.fsm.init() {
+        conn.read_count = Some(count);
+        conn.read = true;
+    } else {
+        panic!("NYI");
+    }
 
-        fsm_state.conns.insert(0, conn);
+    fsm_state.conns.insert(0, conn);
 
-        AcceptConnResult{
-            token: token,
-            fsm_state: fsm_state,
-        }
+    AcceptConnResult{
+        token: token,
+        fsm_state: fsm_state,
+    }
 }
 
 fn handle_fsm_return(returns: Vec<Return>, fsm_state: &mut FsmState, poll_reg: &mut HandleEventsResult) {
