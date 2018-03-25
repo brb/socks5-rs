@@ -8,7 +8,6 @@ use bytes::Bytes;
 use bytes::{ByteOrder, BigEndian};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use mio::tcp::TcpStream;
-use workers::WorkersPool;
 
 const LADDR: &'static str = "127.0.0.1:1080";
 
