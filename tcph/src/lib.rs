@@ -122,12 +122,15 @@ struct AcceptConnResult {
     fsm_state: FsmState,
 }
 
+// TODO main_token -> ?
+// TODO new -> register, old -> reregister ?
 struct HandleEventsResult {
     main_token: Token,
     new: Vec<ConnRef>,
     old: HashSet<ConnRef>,
 }
 
+// TODO A -> ?, H -> ?
 enum PollRegReq {
     A(AcceptConnResult),
     H(HandleEventsResult),
@@ -187,42 +190,39 @@ impl TcpHandler {
                                 let conn = fsm_state.conns.get(&0).unwrap();
                                 self.poll.register(&conn.socket, a.token,
                                     Ready::readable(), PollOpt::edge() | PollOpt::oneshot()).unwrap();
-                           },
-                           PollRegReq::H(h) => {
-                               let fsm_state = Arc::clone(&self.fsm_states.get(&h.main_token).unwrap());
-                               let fsm_state = fsm_state.lock().unwrap();
-                               self.poll_register(&h.new, &h.old, h.main_token, &fsm_state);
-                           }
+                            },
+                            PollRegReq::H(h) => {
+                                let fsm_state = Arc::clone(&self.fsm_states.get(&h.main_token).unwrap());
+                                let fsm_state = fsm_state.lock().unwrap();
+                                self.poll_register(&h.new, &h.old, h.main_token, &fsm_state);
+                            }
                         }
                     }
                     println!("REG_TOKEN: end");
                 } else if let Some(acceptor) = self.acceptors.get(&event.token()) {
-                        let token = self.inner.get_token();
-                        let tx = tx.clone();
-                        let set_ready = set_readiness.clone();
-                        let acceptor = acceptor.clone();
-
-                        self.workers.exec(move || {
-                            let a = accept_connection(&acceptor.lock().unwrap(), token);
-                            tx.send(PollRegReq::A(a)).unwrap();
-                            set_ready.set_readiness(Ready::readable()).unwrap();
-                        });
-
-
-                } else {
-                    let conn_id = *(self.inner.conn_ids.get(&event.token()).unwrap());
-                    let mut f = &self.fsm_states;
-                    let fsm_state = f.get(&conn_id.main_token).unwrap();
-                    let set_ready = set_readiness.clone();
                     let tx = tx.clone();
+                    let ready = set_readiness.clone();
+                    let token = self.inner.get_token();
+                    let acceptor = acceptor.clone();
+
+                    self.workers.exec(move || {
+                        let r = accept_connection(&acceptor.lock().unwrap(), token);
+                        tx.send(PollRegReq::A(r)).unwrap();
+                        ready.set_readiness(Ready::readable()).unwrap();
+                    });
+                } else {
+                    let tx = tx.clone();
+                    let ready = set_readiness.clone();
+                    let conn_id = *(self.inner.conn_ids.get(&event.token()).unwrap());
+                    let fsm_state = self.fsm_states.get(&conn_id.main_token).unwrap();
                     let fsm_state = fsm_state.clone();
 
                     self.workers.exec(move || {
                         let fsm_state = &mut *(fsm_state.lock().unwrap());
-                        let mut poll_reg = handle_events(event.readiness(), conn_id.cref, fsm_state);
-                        poll_reg.main_token = conn_id.main_token;
-                        tx.send(PollRegReq::H(poll_reg)).unwrap();
-                        set_ready.set_readiness(Ready::readable()).unwrap();
+                        let mut r = handle_events(event.readiness(), conn_id.cref, fsm_state);
+                        r.main_token = conn_id.main_token;
+                        tx.send(PollRegReq::H(r)).unwrap();
+                        ready.set_readiness(Ready::readable()).unwrap();
                     });
                 }
             }
@@ -302,36 +302,7 @@ fn accept_connection(acceptor: &Acceptor, token: Token) -> AcceptConnResult {
     }
 }
 
-fn handle_fsm_return(returns: Vec<Return>, fsm_state: &mut FsmState, poll_reg: &mut HandleEventsResult) {
-        for ret in returns {
-            match ret {
-                Return::None => {},
-                Return::ReadExact(cref, count) => {
-                    let mut conn = fsm_state.conns.get_mut(&cref).unwrap();
-                    conn.read_count = Some(count);
-                    conn.read = true;
-                    poll_reg.old.insert(cref);
-                },
-                Return::Read(cref) => {
-                    let mut conn = fsm_state.conns.get_mut(&cref).unwrap();
-                    conn.read_count = Some(0);
-                    conn.read = true;
-                    poll_reg.old.insert(cref);
-                },
-                Return::Write(cref, reply) => {
-                    let mut conn = fsm_state.conns.get_mut(&cref).unwrap();
-                    conn.write_buf.put(reply);
-                    conn.write = true;
-                    poll_reg.old.insert(cref);
-                },
-                Return::Register(cref, socket) => {
-                    let fc = FsmConn::new(socket);
-                    fsm_state.conns.insert(cref, fc);
-                    poll_reg.new.push(cref);
-                },
-            }
-        }
-    }
+//////////////////// START REF /////////////////////////////
 
 fn handle_events(ready: Ready, cref: ConnRef, fsm_state: &mut FsmState) -> HandleEventsResult {
         let mut poll_reg = HandleEventsResult{new: Vec::new(), old: HashSet::new(), main_token: Token(0)};
@@ -407,20 +378,53 @@ fn handle_events(ready: Ready, cref: ConnRef, fsm_state: &mut FsmState) -> Handl
 
 // -> handle_local_read
 fn local_conn_reads(returns: &mut Vec<Return>, cref: ConnRef, conn: &mut FsmConn) {
-        for ret in returns {
-            match ret {
-                &mut Return::ReadExact(cr, count) if cr == cref && count <= conn.read_buf.len() => {
-                    conn.read_count = Some(count);
-                    *ret = Return::None;
-                },
-                &mut Return::Read(cr) if cr == cref && conn.read_buf.len() > 0 => {
-                    conn.read_count = Some(0);
-                    *ret = Return::None;
-                },
-                _ => {},
-            }
+    for ret in returns {
+        match ret {
+            &mut Return::ReadExact(cr, count) if cr == cref && count <= conn.read_buf.len() => {
+                conn.read_count = Some(count);
+                *ret = Return::None;
+            },
+            &mut Return::Read(cr) if cr == cref && conn.read_buf.len() > 0 => {
+                conn.read_count = Some(0);
+                *ret = Return::None;
+            },
+            _ => {},
         }
     }
+}
+
+fn handle_fsm_return(returns: Vec<Return>, fsm_state: &mut FsmState, poll_reg: &mut HandleEventsResult) {
+    for ret in returns {
+        match ret {
+            Return::None => {},
+            Return::ReadExact(cref, count) => {
+                let mut conn = fsm_state.conns.get_mut(&cref).unwrap();
+                conn.read_count = Some(count);
+                conn.read = true;
+                poll_reg.old.insert(cref);
+            },
+            Return::Read(cref) => {
+                let mut conn = fsm_state.conns.get_mut(&cref).unwrap();
+                conn.read_count = Some(0);
+                conn.read = true;
+                poll_reg.old.insert(cref);
+            },
+            Return::Write(cref, reply) => {
+                let mut conn = fsm_state.conns.get_mut(&cref).unwrap();
+                conn.write_buf.put(reply);
+                conn.write = true;
+                poll_reg.old.insert(cref);
+            },
+            Return::Register(cref, socket) => {
+                let fc = FsmConn::new(socket);
+                fsm_state.conns.insert(cref, fc);
+                poll_reg.new.push(cref);
+            },
+        }
+    }
+}
+
+//////////////////// END REF /////////////////////////////
 
 /// Helpers
 
