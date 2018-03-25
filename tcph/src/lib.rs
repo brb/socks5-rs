@@ -15,7 +15,7 @@ use workers::WorkersPool;
 /// in the channel.
 const REG_TOKEN: Token = Token(0);
 
-/// Unique (inside FSM scope) identifier for TCP connection.
+/// Unique (inside FSM) identifier for a TCP connection.
 ///
 /// The initiating (first) connection is always `ConnRef(0)`.
 type ConnRef = u64;
@@ -44,40 +44,54 @@ impl FsmConn {
     fn new(socket: TcpStream) -> FsmConn {
         FsmConn{
             socket: socket,
-            read_buf: BytesMut::with_capacity(64 * 1024),
-            read_count: None,
             read: false,
-            write_buf: BytesMut::with_capacity(64 * 1024),
+            read_count: None,
+            // TODO Handle overflows, as BytesMut does not grow dynamically.
+            read_buf: BytesMut::with_capacity(64 * 1024),
             write: false,
+            // TODO Handle overflows, as BytesMut does not grow dynamically.
+            write_buf: BytesMut::with_capacity(64 * 1024),
         }
     }
 }
 
+/// Represents TCP listener which spawns an FSM upon a new connection.
 struct Acceptor {
     listener: TcpListener,
     spawn: fn() -> Box<FSM>,
 }
 
+/// Global TCP connection identifier.
 #[derive(Clone, Copy)]
-struct ConnId {
-    main_token: Token, // accepted connection token; used to identify FsmState
+struct GlobalConnRef {
+    /// Token of an accepted by TCP listener connection which is used to identify
+    /// an instance of an FSM.
+    main_token: Token,
+    /// Local TCP connection identifier
     cref: ConnRef,
 }
 
-enum GiveMeWork {
-    Reg(PollReg),
-    Acc(Accept),
-}
-
-struct Accept {
+struct AcceptConnResult {
     token: Token,
     fsm_state: FsmState,
 }
 
-struct PollReg {
+struct HandleEventsResult {
+    main_token: Token,
     new: Vec<ConnRef>,
     old: HashSet<ConnRef>,
-    main_token: Token,
+}
+
+enum PollRegReq {
+    A(AcceptConnResult),
+    H(HandleEventsResult),
+}
+
+/// FSM trait
+
+pub trait FSM: Send + Sync {
+    fn init(&mut self) -> Return;
+    fn handle_event(&mut self, ev: Event) -> Vec<Return>;
 }
 
 #[derive(Debug)]
@@ -88,36 +102,30 @@ pub enum Event {
 }
 
 #[derive(Debug)]
-// TODO change from Bytes to b[..]
+// TODO Bytes -> b[..]
 pub enum Return {
+    // TODO Do not allow FSM to return None; for internal use only.
+    None,
     ReadExact(ConnRef, usize),
     Write(ConnRef, Bytes),
     Register(ConnRef, TcpStream),
     Read(ConnRef),
-    None, // For internal usage only
-    //Terminate(ConnRef), // TODO
-    //WriteAndTerminate(ConnRef, Bytes), // TODO
+    //Terminate(ConnRef),
+    //WriteAndTerminate(ConnRef, Bytes),
 }
 
-pub trait FSM: Send + Sync {
-    fn init(&mut self) -> Return;
-    fn handle_event(&mut self, ev: Event) -> Vec<Return>;
-}
-
-
+// ---------------------------------
 
 struct TcpHandlerInner {
     next_token_index: usize,
-    conn_ids: HashMap<Token, ConnId>,
+    conn_ids: HashMap<Token, GlobalConnRef>,
     tokens: HashMap<(Token, ConnRef), Token>,
 }
-
 
 pub struct TcpHandler {
     workers: WorkersPool,
     poll: Poll,
     inner: TcpHandlerInner,
-
     fsm_states: HashMap<Token, Arc<Mutex<FsmState>>>,
     acceptors: HashMap<Token, Arc<Mutex<Acceptor>>>,
 }
@@ -148,7 +156,7 @@ impl TcpHandler {
    pub fn run(&mut self) -> Result<(), ()> {
         let mut events = Events::with_capacity(1024);
 
-        let (tx, rx) = mpsc::channel::<GiveMeWork>();
+        let (tx, rx) = mpsc::channel::<PollRegReq>();
         let (registration, set_readiness) = mio::Registration::new2();
         self.poll.register(&registration, REG_TOKEN, Ready::readable(), PollOpt::edge()).unwrap();
 
@@ -164,10 +172,10 @@ impl TcpHandler {
                     loop {
                         if let Ok(work) = rx.try_recv() {
                             match work {
-                                GiveMeWork::Acc(acc) => {
+                                PollRegReq::A(acc) => {
                                     let a = Arc::new(Mutex::new(acc.fsm_state));
                                     self.fsm_states.insert(acc.token, Arc::clone(&a));
-                                    self.inner.conn_ids.insert(acc.token, ConnId{main_token: acc.token, cref: 0});
+                                    self.inner.conn_ids.insert(acc.token, GlobalConnRef{main_token: acc.token, cref: 0});
 
                                     // TODO ^^ no need?
                                     // Dirty hack to get a reference to the socket moved above ^^.
@@ -177,7 +185,7 @@ impl TcpHandler {
                                     // Because of the fsm.init() return limitation, we register the socket as readable.
                                     self.poll.register(&conn.socket, acc.token, Ready::readable(), PollOpt::edge() | PollOpt::oneshot()).unwrap();
                                 },
-                                GiveMeWork::Reg(poll_reg) => {
+                                PollRegReq::H(poll_reg) => {
                                     self.poll_reregister(&poll_reg, poll_reg.main_token);
                                 }
                             }
@@ -194,7 +202,7 @@ impl TcpHandler {
 
                         self.workers.exec(move || {
                             let a = accept_connection(&acceptor.lock().unwrap(), token);
-                            tx.send(GiveMeWork::Acc(a)).unwrap();
+                            tx.send(PollRegReq::A(a)).unwrap();
                             set_ready.set_readiness(Ready::readable()).unwrap();
                         });
 
@@ -210,9 +218,9 @@ impl TcpHandler {
 
                     self.workers.exec(move || {
                         let fsm_state = &mut *(fsm_state.lock().unwrap());
-                        let mut poll_reg = handle_poll_events(event.readiness(), conn_id.cref, fsm_state);
+                        let mut poll_reg = handle_events(event.readiness(), conn_id.cref, fsm_state);
                         poll_reg.main_token = conn_id.main_token;
-                        tx.send(GiveMeWork::Reg(poll_reg)).unwrap();
+                        tx.send(PollRegReq::H(poll_reg)).unwrap();
                         set_ready.set_readiness(Ready::readable()).unwrap();
                     });
                 }
@@ -220,12 +228,10 @@ impl TcpHandler {
         }
     }
 
-    // TODO Accept -> AcceptResult
-
-    fn poll_reregister(&mut self, poll_reg: &PollReg, main_token: Token) {
+    fn poll_reregister(&mut self, poll_reg: &HandleEventsResult, main_token: Token) {
         for cref in &poll_reg.new {
             let token = self.inner.get_token();
-            self.inner.conn_ids.insert(token, ConnId{main_token, cref: *cref});
+            self.inner.conn_ids.insert(token, GlobalConnRef{main_token, cref: *cref});
             self.inner.tokens.insert((main_token, *cref), token);
 
             let f = &self.fsm_states;
@@ -276,45 +282,10 @@ impl TcpHandlerInner {
     }
 }
 
-fn read_until_would_block(src: &mut Read, buf: &mut BytesMut) -> Result<(usize, bool), Error> {
-    let mut total_size = 0;
-    let mut tmp_buf = [0; 64];
-
-    loop {
-        match src.read(&mut tmp_buf) {
-            Ok(0) => {
-                return Ok((total_size, true));
-            },
-            Ok(size) => {
-                buf.put(&tmp_buf[0 .. size]);
-                total_size += size;
-            },
-            Err(err) => {
-                if err.kind() == ErrorKind::WouldBlock {
-                    // socket is exhausted
-                    break;
-                } else {
-                    return Err(err);
-                }
-            }
-        }
-    }
-
-    return Ok((total_size, false));
-}
-
-fn write_and_flush(dst: &mut Write, buf: &[u8]) {
-    let size = dst.write(&buf).unwrap();
-    assert_eq!(size, buf.len());
-    dst.flush().unwrap();
-}
-
-fn accept_connection(acceptor: &Acceptor, token: Token) -> Accept {
-        // TODO worker exec {
-
+fn accept_connection(acceptor: &Acceptor, token: Token) -> AcceptConnResult {
         let (socket, _) = acceptor.listener.accept().unwrap();
 
-        // Create a FSM instance
+        // Create an FSM instance
         let fsm = (acceptor.spawn)();
         let mut conn = FsmConn::new(socket);
         let mut fsm_state = FsmState{
@@ -332,13 +303,13 @@ fn accept_connection(acceptor: &Acceptor, token: Token) -> Accept {
 
         fsm_state.conns.insert(0, conn);
 
-        Accept{
+        AcceptConnResult{
             token: token,
             fsm_state: fsm_state,
         }
 }
 
-fn handle_fsm_return(returns: Vec<Return>, fsm_state: &mut FsmState, poll_reg: &mut PollReg) {
+fn handle_fsm_return(returns: Vec<Return>, fsm_state: &mut FsmState, poll_reg: &mut HandleEventsResult) {
         for ret in returns {
             match ret {
                 Return::None => {},
@@ -369,8 +340,8 @@ fn handle_fsm_return(returns: Vec<Return>, fsm_state: &mut FsmState, poll_reg: &
         }
     }
 
-fn handle_poll_events(ready: Ready, cref: ConnRef, fsm_state: &mut FsmState) -> PollReg {
-        let mut poll_reg = PollReg{new: Vec::new(), old: HashSet::new(), main_token: Token(0)};
+fn handle_events(ready: Ready, cref: ConnRef, fsm_state: &mut FsmState) -> HandleEventsResult {
+        let mut poll_reg = HandleEventsResult{new: Vec::new(), old: HashSet::new(), main_token: Token(0)};
         let mut returns = Vec::new();
         let mut terminate = false;
 
@@ -436,7 +407,7 @@ fn handle_poll_events(ready: Ready, cref: ConnRef, fsm_state: &mut FsmState) -> 
 
         handle_fsm_return(returns, fsm_state, &mut poll_reg);
 
-        println!("handle_poll_events: exit");
+        println!("handle_events: exit");
 
         return poll_reg;
     }
@@ -457,3 +428,39 @@ fn local_conn_reads(returns: &mut Vec<Return>, cref: ConnRef, conn: &mut FsmConn
             }
         }
     }
+
+/// Helpers
+
+fn read_until_would_block(src: &mut Read, buf: &mut BytesMut) ->
+                                            Result<(usize, bool), Error> {
+    let mut total_size = 0;
+    let mut tmp_buf = [0; 64];
+
+    loop {
+        match src.read(&mut tmp_buf) {
+            Ok(0) => {
+                return Ok((total_size, true));
+            },
+            Ok(size) => {
+                buf.put(&tmp_buf[0 .. size]);
+                total_size += size;
+            },
+            Err(err) => {
+                if err.kind() == ErrorKind::WouldBlock {
+                    // socket is exhausted
+                    break;
+                } else {
+                    return Err(err);
+                }
+            }
+        }
+    }
+
+    return Ok((total_size, false));
+}
+
+fn write_and_flush(dst: &mut Write, buf: &[u8]) {
+    let size = dst.write(&buf).unwrap();
+    assert_eq!(size, buf.len());
+    dst.flush().unwrap();
+}
