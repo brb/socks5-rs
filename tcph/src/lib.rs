@@ -181,15 +181,17 @@ impl TcpHandler {
                                     a.token,
                                     GlobalConnRef{main_token: a.token, cref: 0}
                                 );
+
                                 // Dirty hack to get a reference to the socket moved above ^^.
                                 let fsm_state = fsm_state.lock().unwrap();
                                 let conn = fsm_state.conns.get(&0).unwrap();
-                                self.poll.register(&conn.socket, a.token, Ready::readable(), PollOpt::edge() | PollOpt::oneshot()).unwrap();
+                                self.poll.register(&conn.socket, a.token,
+                                    Ready::readable(), PollOpt::edge() | PollOpt::oneshot()).unwrap();
                            },
                            PollRegReq::H(h) => {
                                let fsm_state = Arc::clone(&self.fsm_states.get(&h.main_token).unwrap());
                                let fsm_state = fsm_state.lock().unwrap();
-                               self.poll_reregister(&h, h.main_token, &fsm_state);
+                               self.poll_register(&h.new, &h.old, h.main_token, &fsm_state);
                            }
                         }
                     }
@@ -227,8 +229,8 @@ impl TcpHandler {
         }
     }
 
-    fn poll_reregister(&mut self, poll_reg: &HandleEventsResult, main_token: Token, fsm_state: &FsmState) {
-        for cref in &poll_reg.new {
+    fn poll_register(&mut self, new: &Vec<ConnRef>, old: &HashSet<ConnRef>, main_token: Token, fsm_state: &FsmState) {
+        for cref in new {
             let token = self.inner.get_token();
             self.inner.conn_ids.insert(token, GlobalConnRef{main_token, cref: *cref});
             self.inner.tokens.insert((main_token, *cref), token);
@@ -238,7 +240,7 @@ impl TcpHandler {
             self.poll.register(&conn.socket, token, Ready::readable(), PollOpt::edge() | PollOpt::oneshot()).unwrap();
         }
 
-        for cref in &poll_reg.old {
+        for cref in old {
             let conn = (*fsm_state).conns.get(cref).unwrap();
 
             let mut ready = Ready::empty();
@@ -251,6 +253,7 @@ impl TcpHandler {
             } else {
                 token = *self.inner.tokens.get(&(main_token, *cref)).unwrap();
             }
+
             println!("reregister: {:?} {:?}", token, ready);
             self.poll.reregister(&conn.socket, token, ready, PollOpt::edge() | PollOpt::oneshot()).unwrap();
         }
@@ -260,7 +263,7 @@ impl TcpHandler {
 impl TcpHandlerInner {
     fn new() -> TcpHandlerInner {
         TcpHandlerInner{
-            token_index: 0, 
+            token_index: 0,
             conn_ids: HashMap::new(),
             tokens: HashMap::new(),
         }
