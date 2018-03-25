@@ -102,7 +102,7 @@ pub enum Return {
 // ---------------------------------
 
 struct TcpHandlerInner {
-    next_token_index: usize,
+    token_index: usize,
     conn_ids: HashMap<Token, GlobalConnRef>,
     tokens: HashMap<(Token, ConnRef), Token>,
 }
@@ -270,16 +270,15 @@ impl TcpHandler {
 impl TcpHandlerInner {
     fn new() -> TcpHandlerInner {
         TcpHandlerInner{
-            next_token_index: 1,
+            token_index: 0, 
             conn_ids: HashMap::new(),
             tokens: HashMap::new(),
         }
     }
 
     fn get_token(&mut self) -> Token {
-        let token = Token(self.next_token_index);
-        self.next_token_index += 1;
-        token
+        self.token_index += 1;
+        Token(self.token_index)
     }
 }
 
