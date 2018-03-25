@@ -11,17 +11,33 @@ use mio::tcp::{TcpListener, TcpStream};
 use bytes::{BytesMut, Bytes, BufMut};
 use workers::WorkersPool;
 
-// A mio token for notifying about registration request in a channel
+/// A mio token for notifying the dispatcher thread about poll registration requests
+/// in the channel.
 const REG_TOKEN: Token = Token(0);
 
+/// Unique (inside FSM scope) identifier for TCP connection.
+///
+/// The initiating (first) connection is always `ConnRef(0)`.
+type ConnRef = u64;
+
+/// Represents a state of an FSM instance.
+struct FsmState {
+    fsm: Box<FSM>,
+    conns: HashMap<ConnRef, FsmConn>,
+}
+
+/// Represents a TCP connection of an FSM instance.
 #[derive(Debug)]
 struct FsmConn {
     socket: TcpStream,
-    read_buf: BytesMut,
-    req_read_count: Option<usize>,
+    /// The FSM requested to read from the socket.
     read: bool,
-    write_buf: BytesMut,
+    /// How many bytes to read from the socket.
+    read_count: Option<usize>,
+    read_buf: BytesMut,
+    /// The FSM requested to write to the socket.
     write: bool,
+    write_buf: BytesMut,
 }
 
 impl FsmConn {
@@ -29,17 +45,12 @@ impl FsmConn {
         FsmConn{
             socket: socket,
             read_buf: BytesMut::with_capacity(64 * 1024),
-            req_read_count: None,
+            read_count: None,
             read: false,
             write_buf: BytesMut::with_capacity(64 * 1024),
             write: false,
         }
     }
-}
-
-struct FsmState {
-    conns: HashMap<ConnRef, FsmConn>,
-    fsm: Box<FSM>,
 }
 
 struct Acceptor {
@@ -68,8 +79,6 @@ struct PollReg {
     old: HashSet<ConnRef>,
     main_token: Token,
 }
-
-type ConnRef = u64;
 
 #[derive(Debug)]
 pub enum Event {
@@ -315,7 +324,7 @@ fn accept_connection(acceptor: &Acceptor, token: Token) -> Accept {
 
         // Currently, only ReadExact(0, <..>) is supported in fsm.init() return
         if let Return::ReadExact(0, count) = fsm_state.fsm.init() {
-            conn.req_read_count = Some(count);
+            conn.read_count = Some(count);
             conn.read = true;
         } else {
             panic!("NYI");
@@ -335,13 +344,13 @@ fn handle_fsm_return(returns: Vec<Return>, fsm_state: &mut FsmState, poll_reg: &
                 Return::None => {},
                 Return::ReadExact(cref, count) => {
                     let mut conn = fsm_state.conns.get_mut(&cref).unwrap();
-                    conn.req_read_count = Some(count);
+                    conn.read_count = Some(count);
                     conn.read = true;
                     poll_reg.old.insert(cref);
                 },
                 Return::Read(cref) => {
                     let mut conn = fsm_state.conns.get_mut(&cref).unwrap();
-                    conn.req_read_count = Some(0);
+                    conn.read_count = Some(0);
                     conn.read = true;
                     poll_reg.old.insert(cref);
                 },
@@ -390,13 +399,13 @@ fn handle_poll_events(ready: Ready, cref: ConnRef, fsm_state: &mut FsmState) -> 
             if terminate {
                 let len = conn.read_buf.len();
                 let buf = conn.read_buf.split_to(len);
-                conn.req_read_count = None;
+                conn.read_count = None;
                 conn.read = false;
                 let e = Event::Terminate(cref, buf.freeze());
                 let mut ret = fsm_state.fsm.handle_event(e);
                 returns.append(&mut ret);
             } else {
-                while let Some(c) = conn.req_read_count {
+                while let Some(c) = conn.read_count {
                     let count;
                     // Read(cref)
                     if c == 0 && conn.read_buf.len() > 0 {
@@ -411,7 +420,7 @@ fn handle_poll_events(ready: Ready, cref: ConnRef, fsm_state: &mut FsmState) -> 
                     let buf = conn.read_buf.split_to(count);
 
                     // reset
-                    conn.req_read_count = None;
+                    conn.read_count = None;
                     conn.read = false;
 
                     let e = Event::Read(cref, buf.freeze());
@@ -437,11 +446,11 @@ fn local_conn_reads(returns: &mut Vec<Return>, cref: ConnRef, conn: &mut FsmConn
         for ret in returns {
             match ret {
                 &mut Return::ReadExact(cr, count) if cr == cref && count <= conn.read_buf.len() => {
-                    conn.req_read_count = Some(count);
+                    conn.read_count = Some(count);
                     *ret = Return::None;
                 },
                 &mut Return::Read(cr) if cr == cref && conn.read_buf.len() > 0 => {
-                    conn.req_read_count = Some(0);
+                    conn.read_count = Some(0);
                     *ret = Return::None;
                 },
                 _ => {},
