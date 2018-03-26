@@ -10,6 +10,7 @@ use mio::{Poll, Events, Token, PollOpt, Ready};
 use mio::tcp::{TcpListener, TcpStream};
 use bytes::{BytesMut, Bytes, BufMut};
 use workers::WorkersPool;
+use std::vec::Vec;
 
 /// A mio token for notifying the dispatcher thread about poll registration requests
 /// in the channel.
@@ -20,7 +21,7 @@ const REG_TOKEN: Token = Token(0);
 /// The initiating (first) connection is always `ConnRef(0)`.
 type ConnRef = u64;
 
-/// Represents a state of an FSM instance.
+/// State of an FSM instance.
 struct FsmState {
     fsm: Box<FSM>,
     conns: HashMap<ConnRef, FsmConn>,
@@ -117,11 +118,6 @@ pub struct TcpHandler {
 
 // ----------------------------------
 
-struct AcceptConnResult {
-    token: Token,
-    fsm_state: FsmState,
-}
-
 // TODO main_token -> ?
 // TODO new -> register, old -> reregister ?
 struct HandleEventsResult {
@@ -132,7 +128,7 @@ struct HandleEventsResult {
 
 // TODO A -> ?, H -> ?
 enum PollRegReq {
-    A(AcceptConnResult),
+    A(Vec<FsmState>),
     H(HandleEventsResult),
 }
 
@@ -156,6 +152,7 @@ impl TcpHandler {
         // XXX Possible race (if `register` is allowed to be called after `run`):
         //     we can get notified about a new listener before the acceptor has
         //     been inserted.
+        //     TODO edge and oneshot
         self.poll.register(&listener, token, Ready::readable(), PollOpt::edge()).unwrap();
         self.acceptors.insert(token, Arc::new(Mutex::new(Acceptor{listener, spawn})));
     }
@@ -170,6 +167,7 @@ impl TcpHandler {
         loop {
             println!("loop: start");
             self.poll.poll(&mut events, None).unwrap();
+            println!("events");
             for event in &events {
                 println!("got event: {:?}", event);
 
@@ -178,18 +176,22 @@ impl TcpHandler {
                     while let Ok(req) = rx.try_recv() {
                         match req {
                             PollRegReq::A(a) => {
-                                let fsm_state = Arc::new(Mutex::new(a.fsm_state));
-                                self.fsm_states.insert(a.token, Arc::clone(&fsm_state));
-                                self.inner.conn_ids.insert(
-                                    a.token,
-                                    GlobalConnRef{main_token: a.token, cref: 0}
-                                );
+                                for fsm_state in a {
+                                    let token = self.inner.get_token();
+                                    let fsm_state = Arc::new(Mutex::new(fsm_state));
 
-                                // Dirty hack to get a reference to the socket moved above ^^.
-                                let fsm_state = fsm_state.lock().unwrap();
-                                let conn = fsm_state.conns.get(&0).unwrap();
-                                self.poll.register(&conn.socket, a.token,
-                                    Ready::readable(), PollOpt::edge() | PollOpt::oneshot()).unwrap();
+                                    self.fsm_states.insert(token, Arc::clone(&fsm_state));
+                                    self.inner.conn_ids.insert(
+                                        token,
+                                        GlobalConnRef{main_token: token, cref: 0}
+                                    );
+
+                                    // Dirty hack to get a reference to the socket moved above ^^.
+                                    let fsm_state = fsm_state.lock().unwrap();
+                                    let conn = fsm_state.conns.get(&0).unwrap();
+                                    self.poll.register(&conn.socket, token,
+                                        Ready::readable(), PollOpt::edge() | PollOpt::oneshot()).unwrap();
+                                }
                             },
                             PollRegReq::H(h) => {
                                 let fsm_state = Arc::clone(&self.fsm_states.get(&h.main_token).unwrap());
@@ -202,11 +204,11 @@ impl TcpHandler {
                 } else if let Some(acceptor) = self.acceptors.get(&event.token()) {
                     let tx = tx.clone();
                     let ready = set_readiness.clone();
-                    let token = self.inner.get_token();
                     let acceptor = acceptor.clone();
 
                     self.workers.exec(move || {
-                        let r = accept_connection(&acceptor.lock().unwrap(), token);
+                        let acceptor = acceptor.lock().unwrap();
+                        let r = accept_connections(&acceptor);
                         tx.send(PollRegReq::A(r)).unwrap();
                         ready.set_readiness(Ready::readable()).unwrap();
                     });
@@ -219,7 +221,7 @@ impl TcpHandler {
 
                     self.workers.exec(move || {
                         let fsm_state = &mut *(fsm_state.lock().unwrap());
-                        let mut r = handle_events(event.readiness(), conn_id.cref, fsm_state);
+                        let mut r = handle_events(event.readiness(), conn_id.cref, fsm_state, conn_id.main_token);
                         r.main_token = conn_id.main_token;
                         tx.send(PollRegReq::H(r)).unwrap();
                         ready.set_readiness(Ready::readable()).unwrap();
@@ -271,40 +273,54 @@ impl TcpHandlerInner {
 
     fn get_token(&mut self) -> Token {
         self.token_index += 1;
-        Token(self.token_index)
+        let t = Token(self.token_index);
+        println!("token: {:?}", t);
+        t
     }
 }
 
-fn accept_connection(acceptor: &Acceptor, token: Token) -> AcceptConnResult {
-    let (socket, _) = acceptor.listener.accept().unwrap();
+fn accept_connections(acceptor: &Acceptor) -> Vec<FsmState> {
+    let mut states = Vec::new();
 
-    // Create an FSM instance
-    let fsm = (acceptor.spawn)();
-    let mut conn = FsmConn::new(socket);
-    let mut fsm_state = FsmState{
-        conns: HashMap::new(),
-        fsm: fsm,
-    };
+    loop {
+        match acceptor.listener.accept() {
+            Err(err) => {
+                if err.kind() == ErrorKind::WouldBlock {
+                    println!(" >>>>>>>>>>  None! <<<<<<<<<<<<");
+                    break;
+                } else {
+                    panic!("accept_connections: {:?}", err);
+                }
+            }
+            Ok((socket, _)) => {
+                // Create an FSM instance
+                let fsm = (acceptor.spawn)();
+                let mut conn = FsmConn::new(socket);
+                let mut fsm_state = FsmState{
+                    conns: HashMap::new(),
+                    fsm: fsm,
+                };
 
-    // Currently, only ReadExact(0, <..>) is supported in fsm.init() return
-    if let Return::ReadExact(0, count) = fsm_state.fsm.init() {
-        conn.read_count = Some(count);
-        conn.read = true;
-    } else {
-        panic!("NYI");
+                // Currently, only ReadExact(0, <..>) is supported in fsm.init() return
+                if let Return::ReadExact(0, count) = fsm_state.fsm.init() {
+                    conn.read_count = Some(count);
+                    conn.read = true;
+                } else {
+                    panic!("NYI");
+                }
+
+                fsm_state.conns.insert(0, conn);
+                states.push(fsm_state);
+            }
+        }
     }
 
-    fsm_state.conns.insert(0, conn);
-
-    AcceptConnResult{
-        token: token,
-        fsm_state: fsm_state,
-    }
+    states
 }
 
 //////////////////// START REF /////////////////////////////
 
-fn handle_events(ready: Ready, cref: ConnRef, fsm_state: &mut FsmState) -> HandleEventsResult {
+fn handle_events(ready: Ready, cref: ConnRef, fsm_state: &mut FsmState, dbg_token: Token) -> HandleEventsResult {
         let mut poll_reg = HandleEventsResult{new: Vec::new(), old: HashSet::new(), main_token: Token(0)};
         let mut returns = Vec::new();
         let mut terminate = false;
@@ -337,6 +353,7 @@ fn handle_events(ready: Ready, cref: ConnRef, fsm_state: &mut FsmState) -> Handl
                 conn.read_count = None;
                 conn.read = false;
                 let e = Event::Terminate(cref, buf.freeze());
+                println!("terminate: {:?}", dbg_token);
                 let mut ret = fsm_state.fsm.handle_event(e);
                 returns.append(&mut ret);
             } else {
@@ -359,6 +376,7 @@ fn handle_events(ready: Ready, cref: ConnRef, fsm_state: &mut FsmState) -> Handl
                     conn.read = false;
 
                     let e = Event::Read(cref, buf.freeze());
+                    println!("fsm.handle_event: {:?}", dbg_token);
                     let mut ret = fsm_state.fsm.handle_event(e);
 
                     // process local read requests
