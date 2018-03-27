@@ -345,7 +345,6 @@ fn handle_events(ready: Ready, cref: ConnRef, fsm_state: &mut FsmState) -> Handl
                 conn.read_count = None;
                 conn.read = false;
                 let e = Event::Terminate(cref, buf.freeze());
-                println!("terminate: {:?}", dbg_token);
                 let mut ret = fsm_state.fsm.handle_event(e);
                 returns.append(&mut ret);
             } else {
@@ -368,7 +367,6 @@ fn handle_events(ready: Ready, cref: ConnRef, fsm_state: &mut FsmState) -> Handl
                     conn.read = false;
 
                     let e = Event::Read(cref, buf.freeze());
-                    println!("fsm.handle_event: {:?}", dbg_token);
                     let mut ret = fsm_state.fsm.handle_event(e);
 
                     // process local read requests
