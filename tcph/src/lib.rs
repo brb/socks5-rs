@@ -156,11 +156,11 @@ impl TcpHandler {
         self.acceptors.insert(token, Arc::new(Mutex::new(Acceptor{listener, spawn})));
     }
 
-   pub fn run(&mut self) {
+    pub fn run(&mut self) {
         let mut events = Events::with_capacity(1024);
 
         let (reg_tx, reg_rx) = mpsc::channel::<RegReq>();
-        let (reg, ready) = mio::Registration::new2();
+        let (reg, set_ready) = mio::Registration::new2();
         self.poll.register(&reg, REG_TOKEN, Ready::readable(), PollOpt::edge()).unwrap();
 
         loop {
@@ -170,69 +170,71 @@ impl TcpHandler {
                 if event.token() == REG_TOKEN {
                     while let Ok(req) = reg_rx.try_recv() {
                         match req {
-                            RegReq::New(fsm_states) => {
-                                for fsm_state in fsm_states {
-                                    let token = self.inner.get_token();
-                                    let fsm_state = Arc::new(Mutex::new(fsm_state));
-
-                                    self.fsm_states.insert(token, Arc::clone(&fsm_state));
-                                    self.inner.conn_ids.insert(
-                                        token,
-                                        GlobalConnRef{main_token: token, cref: 0}
-                                    );
-
-                                    // Dirty hack to get a reference to the socket moved above ^^.
-                                    let fsm_state = fsm_state.lock().unwrap();
-                                    let conn = fsm_state.conns.get(&0).unwrap();
-                                    self.poll.register(&conn.socket, token,
-                                        Ready::readable(), PollOpt::edge() | PollOpt::oneshot()).unwrap();
-                                }
-                            },
+                            RegReq::New(fsm_states) =>
+                                self.register_new_fsms(fsm_states),
                             RegReq::Existing(h) => {
                                 let fsm_state = Arc::clone(&self.fsm_states.get(&h.main_token).unwrap());
                                 let fsm_state = fsm_state.lock().unwrap();
-                                self.poll_register(&h.new, &h.old, h.main_token, &fsm_state);
+                                self.register_conns(&h.new, &h.old, h.main_token, &fsm_state);
                             }
                         }
                     }
                 } else if let Some(acceptor) = self.acceptors.get(&event.token()) {
                     let reg_tx = reg_tx.clone();
-                    let ready = ready.clone();
+                    let set_ready = set_ready.clone();
                     let acceptor = acceptor.clone();
 
                     self.workers.exec(move || {
                         let acceptor = acceptor.lock().unwrap();
                         let fsm_states = accept_connections(&acceptor);
                         reg_tx.send(RegReq::New(fsm_states)).unwrap();
-                        ready.set_readiness(Ready::readable()).unwrap();
+                        set_ready.set_readiness(Ready::readable()).unwrap();
                     });
                 } else {
                     let reg_tx = reg_tx.clone();
-                    let ready = ready.clone();
+                    let set_ready = set_ready.clone();
                     let conn_id = *(self.inner.conn_ids.get(&event.token()).unwrap());
                     let fsm_state = self.fsm_states.get(&conn_id.main_token).unwrap();
                     let fsm_state = fsm_state.clone();
 
                     self.workers.exec(move || {
                         let fsm_state = &mut *(fsm_state.lock().unwrap());
-                        let mut r = handle_events(event.readiness(), conn_id.cref, fsm_state, conn_id.main_token);
+                        let mut r = handle_events(event.readiness(), conn_id.cref, fsm_state);
                         r.main_token = conn_id.main_token;
                         reg_tx.send(RegReq::Existing(r)).unwrap();
-                        ready.set_readiness(Ready::readable()).unwrap();
+                        set_ready.set_readiness(Ready::readable()).unwrap();
                     });
                 }
             }
         }
     }
 
-    fn poll_register(&mut self, new: &Vec<ConnRef>, old: &HashSet<ConnRef>, main_token: Token, fsm_state: &FsmState) {
+    fn register_new_fsms(&mut self, fsm_states: Vec<FsmState>) {
+        for fsm_state in fsm_states {
+            let token = self.inner.get_token();
+            let fsm_state = Arc::new(Mutex::new(fsm_state));
+
+            self.fsm_states.insert(token, Arc::clone(&fsm_state));
+            self.inner.conn_ids.insert(
+                token,
+                GlobalConnRef{main_token: token, cref: 0}
+            );
+
+            // Dirty hack to get a reference to the socket moved above ^^.
+            let fsm_state = fsm_state.lock().unwrap();
+            let conn = fsm_state.conns.get(&0).unwrap();
+            self.poll.register(&conn.socket, token,
+                Ready::readable(), PollOpt::edge() | PollOpt::oneshot()).unwrap();
+        }
+    }
+
+    fn register_conns(&mut self, new: &Vec<ConnRef>, old: &HashSet<ConnRef>, main_token: Token, fsm_state: &FsmState) {
         for cref in new {
             let token = self.inner.get_token();
             self.inner.conn_ids.insert(token, GlobalConnRef{main_token, cref: *cref});
             self.inner.tokens.insert((main_token, *cref), token);
 
             let conn = (*fsm_state).conns.get(cref).unwrap();
-            println!("register: {:?} Readable", token);
             self.poll.register(&conn.socket, token, Ready::readable(), PollOpt::edge() | PollOpt::oneshot()).unwrap();
         }
 
@@ -250,7 +252,6 @@ impl TcpHandler {
                 token = *self.inner.tokens.get(&(main_token, *cref)).unwrap();
             }
 
-            println!("reregister: {:?} {:?}", token, ready);
             self.poll.reregister(&conn.socket, token, ready, PollOpt::edge() | PollOpt::oneshot()).unwrap();
         }
     }
@@ -311,7 +312,7 @@ fn accept_connections(acceptor: &Acceptor) -> Vec<FsmState> {
 
 //////////////////// START REF /////////////////////////////
 
-fn handle_events(ready: Ready, cref: ConnRef, fsm_state: &mut FsmState, dbg_token: Token) -> HandleEventsResult {
+fn handle_events(ready: Ready, cref: ConnRef, fsm_state: &mut FsmState) -> HandleEventsResult {
         let mut poll_reg = HandleEventsResult{new: Vec::new(), old: HashSet::new(), main_token: Token(0)};
         let mut returns = Vec::new();
         let mut terminate = false;
