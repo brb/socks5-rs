@@ -149,10 +149,9 @@ impl TcpHandler {
         let listener = TcpListener::bind(addr).unwrap();
         let token = self.inner.get_token();
 
-        // XXX Possible race (if `register` is allowed to be called after `run`):
+        // XXX Possible race window (if `register` is allowed to be called after `run`):
         //     we can get notified about a new listener before the acceptor has
         //     been inserted.
-        //     TODO edge and oneshot
         self.poll.register(&listener, token, Ready::readable(), PollOpt::edge()).unwrap();
         self.acceptors.insert(token, Arc::new(Mutex::new(Acceptor{listener, spawn})));
     }
@@ -161,18 +160,13 @@ impl TcpHandler {
         let mut events = Events::with_capacity(1024);
 
         let (tx, rx) = mpsc::channel::<PollRegReq>();
-        let (registration, set_readiness) = mio::Registration::new2();
-        self.poll.register(&registration, REG_TOKEN, Ready::readable(), PollOpt::edge()).unwrap();
+        let (reg, ready) = mio::Registration::new2();
+        self.poll.register(&reg, REG_TOKEN, Ready::readable(), PollOpt::edge()).unwrap();
 
         loop {
-            println!("loop: start");
             self.poll.poll(&mut events, None).unwrap();
-            println!("events");
             for event in &events {
-                println!("got event: {:?}", event);
-
                 if event.token() == REG_TOKEN {
-                    println!("REG_TOKEN: start");
                     while let Ok(req) = rx.try_recv() {
                         match req {
                             PollRegReq::A(a) => {
@@ -200,10 +194,9 @@ impl TcpHandler {
                             }
                         }
                     }
-                    println!("REG_TOKEN: end");
                 } else if let Some(acceptor) = self.acceptors.get(&event.token()) {
                     let tx = tx.clone();
-                    let ready = set_readiness.clone();
+                    let ready = ready.clone();
                     let acceptor = acceptor.clone();
 
                     self.workers.exec(move || {
@@ -214,7 +207,7 @@ impl TcpHandler {
                     });
                 } else {
                     let tx = tx.clone();
-                    let ready = set_readiness.clone();
+                    let ready = ready.clone();
                     let conn_id = *(self.inner.conn_ids.get(&event.token()).unwrap());
                     let fsm_state = self.fsm_states.get(&conn_id.main_token).unwrap();
                     let fsm_state = fsm_state.clone();
@@ -273,9 +266,7 @@ impl TcpHandlerInner {
 
     fn get_token(&mut self) -> Token {
         self.token_index += 1;
-        let t = Token(self.token_index);
-        println!("token: {:?}", t);
-        t
+        Token(self.token_index)
     }
 }
 
@@ -286,7 +277,6 @@ fn accept_connections(acceptor: &Acceptor) -> Vec<FsmState> {
         match acceptor.listener.accept() {
             Err(err) => {
                 if err.kind() == ErrorKind::WouldBlock {
-                    println!(" >>>>>>>>>>  None! <<<<<<<<<<<<");
                     break;
                 } else {
                     panic!("accept_connections: {:?}", err);
@@ -301,7 +291,7 @@ fn accept_connections(acceptor: &Acceptor) -> Vec<FsmState> {
                     fsm: fsm,
                 };
 
-                // Currently, only ReadExact(0, <..>) is supported in fsm.init() return
+                // Only `ReadExact` can be returned by `fsm.init()` atm
                 if let Return::ReadExact(0, count) = fsm_state.fsm.init() {
                     conn.read_count = Some(count);
                     conn.read = true;
@@ -477,5 +467,6 @@ fn read_until_would_block(src: &mut Read, buf: &mut BytesMut) ->
 fn write_and_flush(dst: &mut Write, buf: &[u8]) {
     let size = dst.write(&buf).unwrap();
     assert_eq!(size, buf.len());
+
     dst.flush().unwrap();
 }
