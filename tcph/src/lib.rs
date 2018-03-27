@@ -13,7 +13,7 @@ use workers::WorkersPool;
 use std::vec::Vec;
 
 /// A mio token for notifying the dispatcher thread about poll registration requests
-/// in the channel.
+/// from worker threads.
 const REG_TOKEN: Token = Token(0);
 
 /// Unique (inside FSM) identifier for a TCP connection.
@@ -127,9 +127,9 @@ struct HandleEventsResult {
 }
 
 // TODO A -> ?, H -> ?
-enum PollRegReq {
-    A(Vec<FsmState>),
-    H(HandleEventsResult),
+enum RegReq {
+    New(Vec<FsmState>),
+    Existing(HandleEventsResult),
 }
 
 // ----------------------------------
@@ -159,18 +159,19 @@ impl TcpHandler {
    pub fn run(&mut self) {
         let mut events = Events::with_capacity(1024);
 
-        let (tx, rx) = mpsc::channel::<PollRegReq>();
+        let (reg_tx, reg_rx) = mpsc::channel::<RegReq>();
         let (reg, ready) = mio::Registration::new2();
         self.poll.register(&reg, REG_TOKEN, Ready::readable(), PollOpt::edge()).unwrap();
 
         loop {
             self.poll.poll(&mut events, None).unwrap();
+
             for event in &events {
                 if event.token() == REG_TOKEN {
-                    while let Ok(req) = rx.try_recv() {
+                    while let Ok(req) = reg_rx.try_recv() {
                         match req {
-                            PollRegReq::A(a) => {
-                                for fsm_state in a {
+                            RegReq::New(fsm_states) => {
+                                for fsm_state in fsm_states {
                                     let token = self.inner.get_token();
                                     let fsm_state = Arc::new(Mutex::new(fsm_state));
 
@@ -187,7 +188,7 @@ impl TcpHandler {
                                         Ready::readable(), PollOpt::edge() | PollOpt::oneshot()).unwrap();
                                 }
                             },
-                            PollRegReq::H(h) => {
+                            RegReq::Existing(h) => {
                                 let fsm_state = Arc::clone(&self.fsm_states.get(&h.main_token).unwrap());
                                 let fsm_state = fsm_state.lock().unwrap();
                                 self.poll_register(&h.new, &h.old, h.main_token, &fsm_state);
@@ -195,18 +196,18 @@ impl TcpHandler {
                         }
                     }
                 } else if let Some(acceptor) = self.acceptors.get(&event.token()) {
-                    let tx = tx.clone();
+                    let reg_tx = reg_tx.clone();
                     let ready = ready.clone();
                     let acceptor = acceptor.clone();
 
                     self.workers.exec(move || {
                         let acceptor = acceptor.lock().unwrap();
-                        let r = accept_connections(&acceptor);
-                        tx.send(PollRegReq::A(r)).unwrap();
+                        let fsm_states = accept_connections(&acceptor);
+                        reg_tx.send(RegReq::New(fsm_states)).unwrap();
                         ready.set_readiness(Ready::readable()).unwrap();
                     });
                 } else {
-                    let tx = tx.clone();
+                    let reg_tx = reg_tx.clone();
                     let ready = ready.clone();
                     let conn_id = *(self.inner.conn_ids.get(&event.token()).unwrap());
                     let fsm_state = self.fsm_states.get(&conn_id.main_token).unwrap();
@@ -216,7 +217,7 @@ impl TcpHandler {
                         let fsm_state = &mut *(fsm_state.lock().unwrap());
                         let mut r = handle_events(event.readiness(), conn_id.cref, fsm_state, conn_id.main_token);
                         r.main_token = conn_id.main_token;
-                        tx.send(PollRegReq::H(r)).unwrap();
+                        reg_tx.send(RegReq::Existing(r)).unwrap();
                         ready.set_readiness(Ready::readable()).unwrap();
                     });
                 }
