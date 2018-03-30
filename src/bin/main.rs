@@ -1,11 +1,11 @@
-extern crate mio;
 extern crate bytes;
+extern crate mio;
 extern crate tcph;
 extern crate workers;
 
-use tcph::{FSM, Event, Return};
+use tcph::{Event, Return, FSM};
 use bytes::Bytes;
-use bytes::{ByteOrder, BigEndian};
+use bytes::{BigEndian, ByteOrder};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use mio::tcp::TcpStream;
 
@@ -15,19 +15,22 @@ fn main() {
     let mut tcp_handler = tcph::TcpHandler::new(5);
     let addr = LADDR.parse().unwrap();
     fn builder() -> Box<FSM> {
-        let s = Socks5{inner: Socks5Inner{next_state: State::Init}};
+        let s = Socks5 {
+            inner: Socks5Inner {
+                next_state: State::Init,
+            },
+        };
         Box::new(s)
     };
     tcp_handler.register(&addr, builder);
     tcp_handler.run();
-
 }
 
 struct Socks5Inner {
     next_state: State,
 }
 
-struct Socks5{
+struct Socks5 {
     inner: Socks5Inner,
 }
 
@@ -89,7 +92,7 @@ impl Socks5Inner {
         if let Event::Read(0, ref buf) = ev {
             assert_eq!(5, buf[0]); // SOCKS5 vsn
             assert_eq!(1, buf[1]); // CMD CONNECT
-            // We only support IPv4
+                                   // We only support IPv4
             assert_eq!(1, buf[3]); // ATYP IPv4
             self.next_state = State::ReceiveAddr;
             return vec![Return::ReadExact(0, 6)];
@@ -108,9 +111,16 @@ impl Socks5Inner {
                 let port = addr.port();
                 let ip = ip.octets();
                 let reply: &[u8] = &[
-                    5, 0, 0, 1,
-                    ip[0], ip[1], ip[2], ip[3],
-                    (port >> 8) as u8, port as u8
+                    5,
+                    0,
+                    0,
+                    1,
+                    ip[0],
+                    ip[1],
+                    ip[2],
+                    ip[3],
+                    (port >> 8) as u8,
+                    port as u8,
                 ];
                 self.next_state = State::Proxy;
                 return vec![
@@ -126,23 +136,13 @@ impl Socks5Inner {
 
     fn proxy(&mut self, ev: Event) -> Vec<Return> {
         if let Event::Read(0, buf) = ev {
-            return vec![
-                Return::Write(1, buf),
-                Return::Read(0),
-            ];
+            return vec![Return::Write(1, buf), Return::Read(0)];
         } else if let Event::Read(1, buf) = ev {
-            return vec![
-                Return::Write(0, buf),
-                Return::Read(1),
-            ];
+            return vec![Return::Write(0, buf), Return::Read(1)];
         } else if let Event::Terminate(0, buf) = ev {
-            return vec![
-                Return::Write(1, buf),
-            ];
+            return vec![Return::Write(1, buf)];
         } else if let Event::Terminate(1, buf) = ev {
-            return vec![
-                Return::Write(0, buf),
-            ];
+            return vec![Return::Write(0, buf)];
         }
         panic!("invalid");
     }

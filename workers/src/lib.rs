@@ -1,5 +1,5 @@
 use std::thread;
-use std::sync::{mpsc, Mutex, Arc};
+use std::sync::{mpsc, Arc, Mutex};
 
 trait FnBox {
     fn call_box(self: Box<Self>);
@@ -27,19 +27,19 @@ impl WorkersPool {
         for _ in 1..count {
             let rx = chan.clone();
 
-            thread::spawn(move || {
-                loop {
-                    let f = rx.lock().unwrap().recv().unwrap();
-                    f.call_box();
-                }
+            thread::spawn(move || loop {
+                let f = rx.lock().unwrap().recv().unwrap();
+                f.call_box();
             });
-
         }
 
-        WorkersPool {tx: tx }
+        WorkersPool { tx: tx }
     }
 
-    pub fn exec<F>(&self, f: F) where F: FnOnce() + Send + 'static {
+    pub fn exec<F>(&self, f: F)
+    where
+        F: FnOnce() + Send + 'static,
+    {
         let job = Box::new(f);
         self.tx.send(job).unwrap();
     }
