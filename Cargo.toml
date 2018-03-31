@@ -12,3 +12,7 @@ workers = { path = "workers" }
 
 
 [workspace]
+
+[profile.release]
+debug = true
+lto = false
