@@ -41,7 +41,7 @@ impl FSM for Socks5 {
     }
 
     fn handle_event(&mut self, ev: Event) -> Vec<Return> {
-        println!("handle event: {:?}", self.inner.next_state);
+        //println!("handle event: {:?}", self.inner.next_state);
 
         match self.inner.next_state {
             State::Init => panic!("invalid state"),
@@ -140,10 +140,8 @@ impl Socks5Inner {
         } else if let Event::Read(1, buf) = ev {
             return vec![Return::Write(0, buf), Return::Read(1)];
         } else if let Event::Terminate(0, buf) = ev {
-            println!("terminate 0");
             return vec![Return::Write(1, buf)];
         } else if let Event::Terminate(1, buf) = ev {
-            println!("terminate 1");
             return vec![Return::Write(0, buf)];
         }
         panic!("invalid");

@@ -1,6 +1,7 @@
 use std::thread;
 use std::sync::{mpsc, Arc, Mutex};
 
+// FnBox idea is taken from the rust book
 trait FnBox {
     fn call_box(self: Box<Self>);
 }
@@ -12,8 +13,6 @@ impl<F: FnOnce()> FnBox for F {
 }
 
 type Job = Box<FnBox + Send + 'static>;
-
-//type Job = Box<FnOnce() + Send + 'static>;
 
 pub struct WorkersPool {
     tx: mpsc::Sender<Job>,
