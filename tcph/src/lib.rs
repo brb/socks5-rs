@@ -115,7 +115,7 @@ pub struct TcpHandler {
 
 // ----------------------------------
 
-// TODO main_token -> ?
+// TODO main_token -> ? (fsm_token)?
 // TODO new -> register, old -> reregister ?
 struct HandleEventsResult {
     main_token: Token,
@@ -309,8 +309,7 @@ impl TcpHandler {
         }
 
         for cref in drop {
-            println!("cref: {:?} keys: {:?}", cref, (*fsm_state).conns.keys());
-            (*fsm_state).conns.remove(&cref).unwrap();
+            (*fsm_state).conns.remove(&cref);
         }
     }
 }
@@ -371,7 +370,6 @@ fn accept_connections(acceptor: &Acceptor) -> Vec<FsmState> {
 //////////////////// START REF /////////////////////////////
 
 fn handle_poll_events(ready: Ready, cref: ConnRef, fsm_state: &mut FsmState) -> HandleEventsResult {
-    println!("cref: {:?}", cref);
     let mut poll_reg = HandleEventsResult {
         new: Vec::new(),
         old: HashSet::new(),
