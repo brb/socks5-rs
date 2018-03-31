@@ -31,27 +31,24 @@ struct FsmState {
 #[derive(Debug)]
 struct FsmConn {
     socket: TcpStream,
-    /// The FSM requested to read from the socket.
-    read: bool,
     /// How many bytes to read from the socket.
     read_count: Option<usize>,
     read_buf: BytesMut,
-    /// The FSM requested to write to the socket.
-    write: bool,
     write_buf: BytesMut,
+    /// Connection is terminated, safe to drop.
+    terminate: bool,
 }
 
 impl FsmConn {
     fn new(socket: TcpStream) -> FsmConn {
         FsmConn {
             socket: socket,
-            read: false,
             read_count: None,
             // TODO Handle overflows, as BytesMut does not grow dynamically.
             read_buf: BytesMut::with_capacity(64 * 1024),
-            write: false,
             // TODO Handle overflows, as BytesMut does not grow dynamically.
             write_buf: BytesMut::with_capacity(64 * 1024),
+            terminate: false,
         }
     }
 }
@@ -90,7 +87,7 @@ pub enum Event {
 #[derive(Debug)]
 // TODO Bytes -> b[..]
 pub enum Return {
-    // TODO Do not allow FSM to return None; for internal use only.
+    // TODO Replace None with Optional<T>
     None,
     ReadExact(ConnRef, usize),
     Write(ConnRef, Bytes),
@@ -124,6 +121,7 @@ struct HandleEventsResult {
     main_token: Token,
     new: Vec<ConnRef>,
     old: HashSet<ConnRef>,
+    drop: HashSet<ConnRef>,
 }
 
 // TODO A -> ?, H -> ?
@@ -162,6 +160,8 @@ impl TcpHandler {
     pub fn run(&mut self) {
         let mut events = Events::with_capacity(1024);
 
+        // The following are used for notifying the dispatcher thread about
+        // poll (re-)registration requests.
         let (reg_tx, reg_rx) = mpsc::channel::<RegReq>();
         let (reg, set_ready) = mio::Registration::new2();
         self.poll
@@ -179,8 +179,14 @@ impl TcpHandler {
                             RegReq::Existing(h) => {
                                 let fsm_state =
                                     Arc::clone(&self.fsm_states.get(&h.main_token).unwrap());
-                                let fsm_state = fsm_state.lock().unwrap();
-                                self.register_conns(&h.new, &h.old, h.main_token, &fsm_state);
+                                let mut fsm_state = fsm_state.lock().unwrap();
+                                self.register_conns(
+                                    &h.new,
+                                    &h.old,
+                                    &h.drop,
+                                    h.main_token,
+                                    &mut fsm_state,
+                                );
                             }
                         }
                     }
@@ -204,7 +210,7 @@ impl TcpHandler {
 
                     self.workers.exec(move || {
                         let fsm_state = &mut *(fsm_state.lock().unwrap());
-                        let mut r = handle_events(event.readiness(), conn_id.cref, fsm_state);
+                        let mut r = handle_poll_events(event.readiness(), conn_id.cref, fsm_state);
                         r.main_token = conn_id.main_token;
                         reg_tx.send(RegReq::Existing(r)).unwrap();
                         set_ready.set_readiness(Ready::readable()).unwrap();
@@ -246,8 +252,9 @@ impl TcpHandler {
         &mut self,
         new: &Vec<ConnRef>,
         old: &HashSet<ConnRef>,
+        drop: &HashSet<ConnRef>,
         main_token: Token,
-        fsm_state: &FsmState,
+        fsm_state: &mut FsmState,
     ) {
         for cref in new {
             let token = self.inner.get_token();
@@ -272,31 +279,38 @@ impl TcpHandler {
         }
 
         for cref in old {
-            let conn = (*fsm_state).conns.get(cref).unwrap();
+            if let Some(conn) = (*fsm_state).conns.get(cref) {
+                let mut ready = Ready::empty();
+                //if conn.read {
+                if let Some(_) = conn.read_count {
+                    ready = ready | Ready::readable();
+                }
+                // if conn.write {
+                if conn.write_buf.len() > 0 {
+                    ready = ready | Ready::writable();
+                }
 
-            let mut ready = Ready::empty();
-            if conn.read {
-                ready = ready | Ready::readable();
-            }
-            if conn.write {
-                ready = ready | Ready::writable();
-            }
+                let token;
+                if *cref == 0 {
+                    token = main_token;
+                } else {
+                    token = *self.inner.tokens.get(&(main_token, *cref)).unwrap();
+                }
 
-            let token;
-            if *cref == 0 {
-                token = main_token;
-            } else {
-                token = *self.inner.tokens.get(&(main_token, *cref)).unwrap();
+                self.poll
+                    .reregister(
+                        &conn.socket,
+                        token,
+                        ready,
+                        PollOpt::edge() | PollOpt::oneshot(),
+                    )
+                    .unwrap();
             }
+        }
 
-            self.poll
-                .reregister(
-                    &conn.socket,
-                    token,
-                    ready,
-                    PollOpt::edge() | PollOpt::oneshot(),
-                )
-                .unwrap();
+        for cref in drop {
+            println!("cref: {:?} keys: {:?}", cref, (*fsm_state).conns.keys());
+            (*fsm_state).conns.remove(&cref).unwrap();
         }
     }
 }
@@ -331,6 +345,7 @@ fn accept_connections(acceptor: &Acceptor) -> Vec<FsmState> {
             Ok((socket, _)) => {
                 // Create an FSM instance
                 let fsm = (acceptor.spawn)();
+                // TODO move to a method?
                 let mut conn = FsmConn::new(socket);
                 let mut fsm_state = FsmState {
                     conns: HashMap::new(),
@@ -340,7 +355,6 @@ fn accept_connections(acceptor: &Acceptor) -> Vec<FsmState> {
                 // Only `ReadExact` can be returned by `fsm.init()` atm
                 if let Return::ReadExact(0, count) = fsm_state.fsm.init() {
                     conn.read_count = Some(count);
-                    conn.read = true;
                 } else {
                     panic!("NYI");
                 }
@@ -356,10 +370,12 @@ fn accept_connections(acceptor: &Acceptor) -> Vec<FsmState> {
 
 //////////////////// START REF /////////////////////////////
 
-fn handle_events(ready: Ready, cref: ConnRef, fsm_state: &mut FsmState) -> HandleEventsResult {
+fn handle_poll_events(ready: Ready, cref: ConnRef, fsm_state: &mut FsmState) -> HandleEventsResult {
+    println!("cref: {:?}", cref);
     let mut poll_reg = HandleEventsResult {
         new: Vec::new(),
         old: HashSet::new(),
+        drop: HashSet::new(),
         main_token: Token(0),
     };
     let mut returns = Vec::new();
@@ -373,8 +389,8 @@ fn handle_events(ready: Ready, cref: ConnRef, fsm_state: &mut FsmState) -> Handl
             let buf = &mut conn.read_buf;
             let (_, t) = read_until_would_block(socket, buf).unwrap();
             terminate = t;
-            conn.read = false;
             if !terminate {
+                // TODO umm?
                 poll_reg.old.insert(cref);
             }
         }
@@ -383,7 +399,7 @@ fn handle_events(ready: Ready, cref: ConnRef, fsm_state: &mut FsmState) -> Handl
             let socket = &mut conn.socket;
             write_and_flush(socket, &mut conn.write_buf);
             conn.write_buf.clear();
-            conn.write = false;
+            // TODO umm?
             poll_reg.old.insert(cref);
         }
 
@@ -391,10 +407,12 @@ fn handle_events(ready: Ready, cref: ConnRef, fsm_state: &mut FsmState) -> Handl
             let len = conn.read_buf.len();
             let buf = conn.read_buf.split_to(len);
             conn.read_count = None;
-            conn.read = false;
+            // TODO remove
+            conn.terminate = true;
             let e = Event::Terminate(cref, buf.freeze());
             let mut ret = fsm_state.fsm.handle_event(e);
             returns.append(&mut ret);
+            poll_reg.drop.insert(cref);
         } else {
             while let Some(c) = conn.read_count {
                 let count;
@@ -404,6 +422,7 @@ fn handle_events(ready: Ready, cref: ConnRef, fsm_state: &mut FsmState) -> Handl
                 // ReadExact(cref)
                 } else if c > 0 && conn.read_buf.len() >= c {
                     count = c;
+                // Not enough data
                 } else {
                     break;
                 }
@@ -412,7 +431,6 @@ fn handle_events(ready: Ready, cref: ConnRef, fsm_state: &mut FsmState) -> Handl
 
                 // reset
                 conn.read_count = None;
-                conn.read = false;
 
                 let e = Event::Read(cref, buf.freeze());
                 let mut ret = fsm_state.fsm.handle_event(e);
@@ -426,8 +444,6 @@ fn handle_events(ready: Ready, cref: ConnRef, fsm_state: &mut FsmState) -> Handl
     }
 
     handle_fsm_return(returns, fsm_state, &mut poll_reg);
-
-    println!("handle_events: exit");
 
     return poll_reg;
 }
@@ -460,26 +476,25 @@ fn handle_fsm_return(
             Return::ReadExact(cref, count) => {
                 let mut conn = fsm_state.conns.get_mut(&cref).unwrap();
                 conn.read_count = Some(count);
-                conn.read = true;
                 poll_reg.old.insert(cref);
             }
             Return::Read(cref) => {
                 let mut conn = fsm_state.conns.get_mut(&cref).unwrap();
                 conn.read_count = Some(0);
-                conn.read = true;
                 poll_reg.old.insert(cref);
             }
             Return::Write(cref, reply) => {
-                let mut conn = fsm_state.conns.get_mut(&cref).unwrap();
-                conn.write_buf.put(reply);
-                conn.write = true;
-                poll_reg.old.insert(cref);
+                if let Some(mut conn) = fsm_state.conns.get_mut(&cref) {
+                    //let mut conn = fsm_state.conns.get_mut(&cref).unwrap();
+                    conn.write_buf.put(reply);
+                    poll_reg.old.insert(cref);
+                }
             }
             Return::Register(cref, socket) => {
                 let fc = FsmConn::new(socket);
                 fsm_state.conns.insert(cref, fc);
                 poll_reg.new.push(cref);
-            }
+            } // TODO Return::Terminate
         }
     }
 }
