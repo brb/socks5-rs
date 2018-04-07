@@ -16,9 +16,7 @@ fn main() {
     let addr = LADDR.parse().unwrap();
     fn builder() -> Box<FSM> {
         let s = Socks5 {
-            inner: Socks5Inner {
-                next_state: State::Init,
-            },
+            next_state: State::Init,
         };
         Box::new(s)
     };
@@ -26,45 +24,29 @@ fn main() {
     tcp_handler.run();
 }
 
-struct Socks5Inner {
-    next_state: State,
-}
-
 struct Socks5 {
-    inner: Socks5Inner,
+    next_state: State,
 }
 
 impl FSM for Socks5 {
     fn init(&mut self) -> Return {
-        self.inner.next_state = State::ReceiveVsnAndAuthCount;
+        self.next_state = State::ReceiveVsnAndAuthCount;
         Return::ReadExact(0, 2)
     }
 
     fn handle_event(&mut self, ev: Event) -> Vec<Return> {
-        //println!("handle event: {:?}", self.inner.next_state);
-
-        match self.inner.next_state {
+        match self.next_state {
             State::Init => panic!("invalid state"),
-            State::ReceiveVsnAndAuthCount => self.inner.receive_vsm_and_auth_count(ev),
-            State::ReceiveAuthMethods => self.inner.receive_auth_methods(ev),
-            State::ReceiveAddrType => self.inner.receive_addr_type(ev),
-            State::ReceiveAddr => self.inner.receive_addr(ev),
-            State::Proxy => self.inner.proxy(ev),
+            State::ReceiveVsnAndAuthCount => self.receive_vsm_and_auth_count(ev),
+            State::ReceiveAuthMethods => self.receive_auth_methods(ev),
+            State::ReceiveAddrType => self.receive_addr_type(ev),
+            State::ReceiveAddr => self.receive_addr(ev),
+            State::Proxy => self.proxy(ev),
         }
     }
 }
 
-#[derive(PartialEq, Debug)]
-enum State {
-    Init,
-    ReceiveVsnAndAuthCount,
-    ReceiveAuthMethods,
-    ReceiveAddrType,
-    ReceiveAddr,
-    Proxy,
-}
-
-impl Socks5Inner {
+impl Socks5 {
     fn receive_vsm_and_auth_count(&mut self, ev: Event) -> Vec<Return> {
         if let Event::Read(0, bytes) = ev {
             assert_eq!(5, bytes[0]); // SOCKS5 vsn
@@ -146,4 +128,15 @@ impl Socks5Inner {
         }
         panic!("invalid");
     }
+
+}
+
+#[derive(PartialEq, Debug)]
+enum State {
+    Init,
+    ReceiveVsnAndAuthCount,
+    ReceiveAuthMethods,
+    ReceiveAddrType,
+    ReceiveAddr,
+    Proxy,
 }
