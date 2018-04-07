@@ -44,7 +44,7 @@ impl FsmConn {
             read_count: None,
             // TODO Handle overflows, as BytesMut does not grow dynamically.
             read_buf: BytesMut::with_capacity(64 * 1024),
-            // TODO Handle overflows, as BytesMut does not grow dynamically.
+            // TODO same ^^.
             write_buf: BytesMut::with_capacity(64 * 1024),
         }
     }
@@ -94,18 +94,14 @@ pub enum Return {
     //WriteAndTerminate(ConnRef, Bytes),
 }
 
-struct TcpHandlerInner {
-    token_index: usize,
-    conn_ids: HashMap<Token, GlobalConnRef>,
-    tokens: HashMap<(Token, ConnRef), Token>,
-}
-
 pub struct TcpHandler {
     workers: WorkersPool,
     poll: Poll,
-    inner: TcpHandlerInner,
     fsm_states: HashMap<Token, Arc<Mutex<FsmState>>>,
     acceptors: HashMap<Token, Arc<Mutex<Acceptor>>>,
+    token_index: usize,
+    conn_ids: HashMap<Token, GlobalConnRef>,
+    tokens: HashMap<(Token, ConnRef), Token>,
 }
 
 struct PollReg {
@@ -127,13 +123,15 @@ impl TcpHandler {
             poll: Poll::new().unwrap(),
             fsm_states: HashMap::new(),
             acceptors: HashMap::new(),
-            inner: TcpHandlerInner::new(),
+            token_index: 0,
+            conn_ids: HashMap::new(),
+            tokens: HashMap::new(),
         }
     }
 
     pub fn register(&mut self, addr: &SocketAddr, spawn: fn() -> Box<FSM>) {
         let listener = TcpListener::bind(addr).unwrap();
-        let token = self.inner.get_token();
+        let token = self.get_token();
 
         // XXX Possible race window (if `register` is allowed to be called after `run`):
         //     we can get notified about a new listener before the acceptor has
@@ -143,6 +141,22 @@ impl TcpHandler {
             .unwrap();
         self.acceptors
             .insert(token, Arc::new(Mutex::new(Acceptor { listener, spawn })));
+    }
+
+    fn foo(&mut self, req: RegReq) {
+        match req {
+            RegReq::New(fsm_states) => self.register_new_fsms(fsm_states),
+            RegReq::Update(r) => {
+                let fsm_state = Arc::clone(&self.fsm_states.get(&r.fsm_token).unwrap());
+                let mut fsm_state = fsm_state.lock().unwrap();
+                self.update_conns(&r.new, &r.existing, &r.drop, r.fsm_token, &mut fsm_state);
+            }
+        }
+    }
+
+    fn get_token(&mut self) -> Token {
+        self.token_index += 1;
+        Token(self.token_index)
     }
 
     pub fn run(&mut self) {
@@ -162,21 +176,7 @@ impl TcpHandler {
             for event in &events {
                 if event.token() == REG_TOKEN {
                     while let Ok(req) = reg_rx.try_recv() {
-                        match req {
-                            RegReq::New(fsm_states) => self.register_new_fsms(fsm_states),
-                            RegReq::Update(r) => {
-                                let fsm_state =
-                                    Arc::clone(&self.fsm_states.get(&r.fsm_token).unwrap());
-                                let mut fsm_state = fsm_state.lock().unwrap();
-                                self.update_conns(
-                                    &r.new,
-                                    &r.existing,
-                                    &r.drop,
-                                    r.fsm_token,
-                                    &mut fsm_state,
-                                );
-                            }
-                        }
+                        self.foo(req);
                     }
                 } else if let Some(acceptor) = self.acceptors.get(&event.token()) {
                     let reg_tx = reg_tx.clone();
@@ -192,7 +192,7 @@ impl TcpHandler {
                 } else {
                     let reg_tx = reg_tx.clone();
                     let set_ready = set_ready.clone();
-                    let conn_id = *(self.inner.conn_ids.get(&event.token()).unwrap());
+                    let conn_id = *(self.conn_ids.get(&event.token()).unwrap());
                     let fsm_state = self.fsm_states.get(&conn_id.fsm_token).unwrap();
                     let fsm_state = fsm_state.clone();
 
@@ -210,11 +210,11 @@ impl TcpHandler {
 
     fn register_new_fsms(&mut self, fsm_states: Vec<FsmState>) {
         for fsm_state in fsm_states {
-            let token = self.inner.get_token();
+            let token = self.get_token();
             let fsm_state = Arc::new(Mutex::new(fsm_state));
 
             self.fsm_states.insert(token, Arc::clone(&fsm_state));
-            self.inner.conn_ids.insert(
+            self.conn_ids.insert(
                 token,
                 GlobalConnRef {
                     fsm_token: token,
@@ -245,15 +245,15 @@ impl TcpHandler {
         fsm_state: &mut FsmState,
     ) {
         for cref in new {
-            let token = self.inner.get_token();
-            self.inner.conn_ids.insert(
+            let token = self.get_token();
+            self.conn_ids.insert(
                 token,
                 GlobalConnRef {
                     fsm_token,
                     cref: *cref,
                 },
             );
-            self.inner.tokens.insert((fsm_token, *cref), token);
+            self.tokens.insert((fsm_token, *cref), token);
 
             let conn = (*fsm_state).conns.get(cref).unwrap();
             self.poll
@@ -282,7 +282,7 @@ impl TcpHandler {
                 if *cref == 0 {
                     token = fsm_token;
                 } else {
-                    token = *self.inner.tokens.get(&(fsm_token, *cref)).unwrap();
+                    token = *self.tokens.get(&(fsm_token, *cref)).unwrap();
                 }
 
                 self.poll
@@ -299,21 +299,6 @@ impl TcpHandler {
         for cref in drop {
             (*fsm_state).conns.remove(&cref);
         }
-    }
-}
-
-impl TcpHandlerInner {
-    fn new() -> TcpHandlerInner {
-        TcpHandlerInner {
-            token_index: 0,
-            conn_ids: HashMap::new(),
-            tokens: HashMap::new(),
-        }
-    }
-
-    fn get_token(&mut self) -> Token {
-        self.token_index += 1;
-        Token(self.token_index)
     }
 }
 

@@ -1,7 +1,7 @@
 use std::thread;
 use std::sync::{mpsc, Arc, Mutex};
 
-// FnBox idea is taken from the rust book
+// FnBox idea is taken from the Rust book
 trait FnBox {
     fn call_box(self: Box<Self>);
 }
