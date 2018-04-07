@@ -1,3 +1,5 @@
+//! A generic TCP handler for implementing custom protocols.
+
 extern crate bytes;
 extern crate mio;
 extern crate workers;
@@ -12,22 +14,68 @@ use bytes::{BufMut, Bytes, BytesMut};
 use workers::WorkersPool;
 use std::vec::Vec;
 
-/// A mio token for notifying the dispatcher thread about poll registration requests
-/// from worker threads.
+/// mio token for notifying the dispatcher thread about poll registration
+/// requests from worker threads.
 const REG_TOKEN: Token = Token(0);
 
-/// Unique (inside FSM) identifier for a TCP connection.
+/// Unique (within an FSM instance) identifier for a TCP connection.
 ///
 /// The initiating (first) connection is always `ConnRef(0)`.
 type ConnRef = u64;
 
+pub trait FSM: Send + Sync {
+    /// Called immediately after spawning an FSM instance.
+    fn init(&mut self) -> Return;
+
+    /// Called when any requested op (read or write) can be fulfilled.
+    fn handle_event(&mut self, ev: Event) -> Vec<Return>;
+}
+
+#[derive(Debug)]
+// TODO Bytes -> b[..]?
+pub enum Return {
+    /// Read the exact amount of bytes from the given connection.
+    ReadExact(ConnRef, usize),
+    /// Write the given buffer to the given connection.
+    Write(ConnRef, Bytes),
+    /// Register the new TCP connection with the given id.
+    Register(ConnRef, TcpStream),
+    /// Read any amount of bytes from the given connection.
+    Read(ConnRef),
+    /// Used internally.
+    None, // TODO Get rid of None by Optional<T>
+    //Terminate(ConnRef), /// TODO NYI
+    //WriteAndTerminate(ConnRef, Bytes), /// TODO NYI
+}
+
+#[derive(Debug)]
+pub enum Event {
+    Read(ConnRef, Bytes),
+    Terminate(ConnRef, Bytes),
+}
+
+/// Unique (global) identifier for a TCP connection.
+#[derive(Clone, Copy)]
+struct GlobalConnRef {
+    /// mio token of a socket which has been created upon accepting a new TCP
+    /// connection.
+    ///
+    /// Accepting the connection results in spawning an FSM instance, so
+    /// the token can be used to identify the FSM.
+    fsm_token: Token,
+    /// Local TCP connection identifier.
+    cref: ConnRef,
+}
+
+
 /// State of an FSM instance.
 struct FsmState {
     fsm: Box<FSM>,
+    /// Map of connections handled by the FSM.
     conns: HashMap<ConnRef, FsmConn>,
 }
 
-/// Represents a TCP connection of an FSM instance.
+/// Represents a TCP connection belonging to an FSM instance.
 #[derive(Debug)]
 struct FsmConn {
     socket: TcpStream,
@@ -37,77 +85,22 @@ struct FsmConn {
     write_buf: BytesMut,
 }
 
-impl FsmConn {
-    fn new(socket: TcpStream) -> FsmConn {
-        FsmConn {
-            socket: socket,
-            read_count: None,
-            // TODO Handle overflows, as BytesMut does not grow dynamically.
-            read_buf: BytesMut::with_capacity(64 * 1024),
-            // TODO same ^^.
-            write_buf: BytesMut::with_capacity(64 * 1024),
-        }
-    }
-}
-
-/// Represents TCP listener which spawns an FSM upon a new connection.
+/// Represents a TCP listener which spawns an FSM instance upon accepting
+/// a new connection.
 struct Acceptor {
     listener: TcpListener,
     spawn: fn() -> Box<FSM>,
 }
 
-/// Global TCP connection identifier.
-#[derive(Clone, Copy)]
-struct GlobalConnRef {
-    /// Token of an accepted by TCP listener connection.
-    ///
-    /// Token can be used to identify an instance of FSM.
-    fsm_token: Token,
-    /// Local TCP connection identifier.
-    cref: ConnRef,
-}
-
-/// FSM trait
-
-pub trait FSM: Send + Sync {
-    fn init(&mut self) -> Return;
-    fn handle_event(&mut self, ev: Event) -> Vec<Return>;
-}
-
-#[derive(Debug)]
-pub enum Event {
-    None,
-    Read(ConnRef, Bytes),
-    Terminate(ConnRef, Bytes),
-}
-
-#[derive(Debug)]
-// TODO Bytes -> b[..]
-pub enum Return {
-    // TODO Replace None with Optional<T>
-    None,
-    ReadExact(ConnRef, usize),
-    Write(ConnRef, Bytes),
-    Register(ConnRef, TcpStream),
-    Read(ConnRef),
-    //Terminate(ConnRef),
-    //WriteAndTerminate(ConnRef, Bytes),
-}
-
-pub struct TcpHandler {
-    workers: WorkersPool,
-    poll: Poll,
-    fsm_states: HashMap<Token, Arc<Mutex<FsmState>>>,
-    acceptors: HashMap<Token, Arc<Mutex<Acceptor>>>,
-    token_index: usize,
-    conn_ids: HashMap<Token, GlobalConnRef>,
-    tokens: HashMap<(Token, ConnRef), Token>,
-}
-
+/// mio polling registration request.
 struct PollReg {
+    /// Used to identify the FSM.
     fsm_token: Token,
+    /// New connections created by the FSM.
     new: Vec<ConnRef>,
+    /// List of connections which need to be re-registered.
     existing: HashSet<ConnRef>,
+    /// Connections which have terminated.
     drop: HashSet<ConnRef>,
 }
 
@@ -116,14 +109,25 @@ enum RegReq {
     Update(PollReg),
 }
 
+pub struct TcpHandler {
+    workers: WorkersPool,
+    /// Monotonically increasing token ids for mio.
+    token_index: usize,
+    poll: Poll,
+    fsm_states: HashMap<Token, Arc<Mutex<FsmState>>>,
+    acceptors: HashMap<Token, Arc<Mutex<Acceptor>>>,
+    conn_ids: HashMap<Token, GlobalConnRef>,
+    tokens: HashMap<(Token, ConnRef), Token>,
+}
+
 impl TcpHandler {
     pub fn new(workers_pool_size: usize) -> TcpHandler {
         TcpHandler {
             workers: WorkersPool::new(workers_pool_size),
             poll: Poll::new().unwrap(),
+            token_index: 0,
             fsm_states: HashMap::new(),
             acceptors: HashMap::new(),
-            token_index: 0,
             conn_ids: HashMap::new(),
             tokens: HashMap::new(),
         }
@@ -133,30 +137,14 @@ impl TcpHandler {
         let listener = TcpListener::bind(addr).unwrap();
         let token = self.get_token();
 
-        // XXX Possible race window (if `register` is allowed to be called after `run`):
-        //     we can get notified about a new listener before the acceptor has
-        //     been inserted.
+        // TODO Possible race window (if `register` is allowed to be called after `run`):
+        //      we can get notified about a new listener before the acceptor has
+        //      been inserted.
         self.poll
             .register(&listener, token, Ready::readable(), PollOpt::edge())
             .unwrap();
         self.acceptors
             .insert(token, Arc::new(Mutex::new(Acceptor { listener, spawn })));
-    }
-
-    fn foo(&mut self, req: RegReq) {
-        match req {
-            RegReq::New(fsm_states) => self.register_new_fsms(fsm_states),
-            RegReq::Update(r) => {
-                let fsm_state = Arc::clone(&self.fsm_states.get(&r.fsm_token).unwrap());
-                let mut fsm_state = fsm_state.lock().unwrap();
-                self.update_conns(&r.new, &r.existing, &r.drop, r.fsm_token, &mut fsm_state);
-            }
-        }
-    }
-
-    fn get_token(&mut self) -> Token {
-        self.token_index += 1;
-        Token(self.token_index)
     }
 
     pub fn run(&mut self) {
@@ -176,7 +164,7 @@ impl TcpHandler {
             for event in &events {
                 if event.token() == REG_TOKEN {
                     while let Ok(req) = reg_rx.try_recv() {
-                        self.foo(req);
+                        self.handle_reg_req(req);
                     }
                 } else if let Some(acceptor) = self.acceptors.get(&event.token()) {
                     let reg_tx = reg_tx.clone();
@@ -296,11 +284,85 @@ impl TcpHandler {
             }
         }
 
+        // remove old connections
         for cref in drop {
             (*fsm_state).conns.remove(&cref);
         }
     }
+
+    fn handle_reg_req(&mut self, req: RegReq) {
+        match req {
+            RegReq::New(fsm_states) => self.register_new_fsms(fsm_states),
+            RegReq::Update(r) => {
+                let fsm_state = Arc::clone(&self.fsm_states.get(&r.fsm_token).unwrap());
+                let mut fsm_state = fsm_state.lock().unwrap();
+                self.update_conns(&r.new, &r.existing, &r.drop, r.fsm_token, &mut fsm_state);
+            }
+        }
+    }
+
+    fn get_token(&mut self) -> Token {
+        self.token_index += 1;
+        Token(self.token_index)
+    }
 }
+
+impl FsmConn {
+    fn new(socket: TcpStream) -> FsmConn {
+        FsmConn {
+            socket: socket,
+            read_count: None,
+            // TODO Handle overflows, as BytesMut does not grow dynamically.
+            read_buf: BytesMut::with_capacity(64 * 1024),
+            // TODO same ^^.
+            write_buf: BytesMut::with_capacity(64 * 1024),
+        }
+    }
+}
+
+impl PollReg {
+    fn new() -> Self {
+        PollReg {
+            fsm_token: Token(0),
+            new: Vec::new(),
+            existing: HashSet::new(),
+            drop: HashSet::new(),
+        }
+    }
+
+    fn handle_fsm_returns(&mut self, rets: Vec<Return>, fsm_state: &mut FsmState) {
+        for r in rets {
+            match r {
+                Return::None => {}
+                Return::ReadExact(cref, count) => {
+                    if let Some(mut conn) = fsm_state.conns.get_mut(&cref) {
+                        conn.read_count = Some(count);
+                        self.existing.insert(cref);
+                    }
+                }
+                Return::Read(cref) => {
+                    if let Some(mut conn) = fsm_state.conns.get_mut(&cref) {
+                        conn.read_count = Some(0);
+                        self.existing.insert(cref);
+                    }
+                }
+                Return::Write(cref, reply) => {
+                    if let Some(mut conn) = fsm_state.conns.get_mut(&cref) {
+                        conn.write_buf.put(reply);
+                        self.existing.insert(cref);
+                    }
+                }
+                Return::Register(cref, socket) => {
+                    let fc = FsmConn::new(socket);
+                    fsm_state.conns.insert(cref, fc);
+                    self.new.push(cref);
+                } // TODO Return::Terminate
+            }
+        }
+    }
+}
+
+/// Helpers
 
 fn accept_connections(acceptor: &Acceptor) -> Vec<FsmState> {
     let mut states = Vec::new();
@@ -412,50 +474,9 @@ fn update_read_counts(rets: &mut Vec<Return>, cref: ConnRef, conn: &mut FsmConn)
     }
 }
 
-impl PollReg {
-    fn new() -> Self {
-        PollReg {
-            fsm_token: Token(0),
-            new: Vec::new(),
-            existing: HashSet::new(),
-            drop: HashSet::new(),
-        }
-    }
-
-    fn handle_fsm_returns(&mut self, rets: Vec<Return>, fsm_state: &mut FsmState) {
-        for r in rets {
-            match r {
-                Return::None => {}
-                Return::ReadExact(cref, count) => {
-                    if let Some(mut conn) = fsm_state.conns.get_mut(&cref) {
-                        conn.read_count = Some(count);
-                        self.existing.insert(cref);
-                    }
-                }
-                Return::Read(cref) => {
-                    if let Some(mut conn) = fsm_state.conns.get_mut(&cref) {
-                        conn.read_count = Some(0);
-                        self.existing.insert(cref);
-                    }
-                }
-                Return::Write(cref, reply) => {
-                    if let Some(mut conn) = fsm_state.conns.get_mut(&cref) {
-                        conn.write_buf.put(reply);
-                        self.existing.insert(cref);
-                    }
-                }
-                Return::Register(cref, socket) => {
-                    let fc = FsmConn::new(socket);
-                    fsm_state.conns.insert(cref, fc);
-                    self.new.push(cref);
-                } // TODO Return::Terminate
-            }
-        }
-    }
-}
-
-/// Helpers
-
+/// Reads from the given src until it would block.
+///
+/// Returns how many bytes were read and whether the src has been closed.
 fn read_until_would_block(src: &mut Read, buf: &mut BytesMut) -> Result<(usize, bool), Error> {
     let mut total_size = 0;
     let mut tmp_buf = [0; 64];
